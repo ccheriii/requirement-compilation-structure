@@ -27,8 +27,13 @@ reference prototype, not a fixed executable host or mandatory component API.
 
 You own the application entrypoints, routing, component composition and state bindings.
 Read task.application_entrypoints as needed and incrementally connect this page to the
-existing application. Preserve all earlier routes/pages/exports and their behavior; never
-rebuild the application with only this page. Support parameterized routes using the actual
+existing application. When changing an existing entrypoint such as App.tsx, inspect its
+imports and route setup, then make only a minimal targeted edit using a unique existing span.
+Do not replace or recreate the whole file, or discard its providers, wrappers, initialization
+or existing routes. Add only the import and route needed for this page; leave the entrypoint
+untouched when its existing routing already supports the page. Preserve all earlier
+routes/pages/exports and their behavior; never rebuild the application with only this page.
+Support parameterized routes using the actual
 router/framework or appropriate application code. Do not require a dynamic route pattern
 to equal the literal browser pathname. Route metadata describes intended navigation.
 

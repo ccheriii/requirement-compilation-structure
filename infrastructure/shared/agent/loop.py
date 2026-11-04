@@ -5,7 +5,7 @@ import json
 from infrastructure.shared.agent.discovery import DISCOVERY_RULES, DiscoverySession
 from infrastructure.shared.agent.conventions import task_conventions
 
-from infrastructure.shared.agent.tools import FileTools
+from infrastructure.shared.agent.tools import FileToolError, FileTools
 from infrastructure.shared.agent.tools.protocol import FILE_TOOL_RULES
 from infrastructure.shared.agent.proposals import RESPONSE_ERRORS, response_feedback
 from infrastructure.shared.project.git import checkpoint
@@ -15,10 +15,29 @@ from infrastructure.utils.files import read_source
 class AgentExhausted(ValueError):
     """A recoverable task failure with the last real repair feedback."""
 
-    def __init__(self, label, turns, feedback):
-        super().__init__(f"Agent exhausted {turns} rounds for {label}")
+    def __init__(self, label, turns, feedback, reason=None):
+        message = f"Agent exhausted {turns} rounds for {label}"
+        if reason:
+            message = f"Agent stopped after {turns} round(s) for {label}: {reason}"
+        super().__init__(message)
         self.turns = turns
         self.feedback = feedback
+
+
+def _is_model_transport_error(error):
+    """Identify provider/network failures that code edits cannot repair."""
+    transport_types = {
+        "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
+        "ReadTimeout", "WriteTimeout", "PoolTimeout", "gaierror",
+    }
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in transport_types:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
@@ -38,6 +57,7 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
     feedback = [] if feedback is None else [feedback_filter(feedback) if feedback_filter else feedback]
     check_feedback = list(feedback)
     for turn in range(1, max_turns + 1):
+        target_read_errors = 0
         console.show(f"{label} | Edit round {turn}/{max_turns}",
             "Generate file edits, then run the stage's compilation and test acceptance checks.")
         response, applied, checking = None, False, False
@@ -90,7 +110,22 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                 elif "tool_calls" in response and files.effect(response["tool_calls"]) == "read":
                     calls = response["tool_calls"]
                     console.show(label + " | Read files", str([call["path"] for call in calls]))
-                    results = files.execute(calls)
+                    try:
+                        results = files.execute(calls)
+                    except FileToolError as error:
+                        feedback_path = (error.feedback or {}).get("path")
+                        if (error.feedback.get("code") != "FILE_NOT_FOUND" or files.target is None
+                                or feedback_path != files.target.path or not files.pending_target):
+                            raise
+                        target_read_errors += 1
+                        if target_read_errors > 2:
+                            raise
+                        context_result = {
+                            "tool_error": error.feedback,
+                            "guidance": "The primary task target is missing. Do not read it; create it with edit_file operation=create.",
+                        }
+                        response = request_model()
+                        continue
                     observation = {"tool_results": results}
                     for item in results:
                         record = item["result"]
@@ -149,4 +184,9 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                 feedback = [*check_feedback, rejected]
             checkpoint(files.output, task=label, action=f"Reject edit round {turn}", status="REJECTED",
                 details={"round": turn, "applied": applied, "feedback": feedback})
+            # The model client already applies its configured transport retries.
+            # Repeating the same prompt cannot repair DNS, connection, or timeout failures.
+            if _is_model_transport_error(error):
+                raise AgentExhausted(label, turn, feedback,
+                    reason=f"model transport failed; stopping instead of retrying edit rounds ({message})") from error
     raise AgentExhausted(label, max_turns, feedback)

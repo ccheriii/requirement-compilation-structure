@@ -22,6 +22,8 @@ from infrastructure.shared.project.git import checkpoint
 TEST_INSTRUCTIONS = """Write one HTTP acceptance suite for task.api before implementing it.
 Derive expected outcomes from the requirement scenarios, API method/path, I/O, P/Q and DB
 changes. Write only the test suite at the destination in task.file_target.
+Use context_request only to discover semantic records or file candidates. To inspect file
+contents, call read_file with a path; do not send file paths or IDs through context_request.
 If task.file_target.path is null, choose a meaningful .test.ts filename inside
 task.file_target.directory, based on task.api_id.
 If the target does not exist, create the complete suite in one edit_file call
