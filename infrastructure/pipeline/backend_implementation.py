@@ -21,7 +21,15 @@ from infrastructure.shared.project.git import checkpoint
 
 TEST_INSTRUCTIONS = """Write one HTTP acceptance suite for task.api before implementing it.
 Derive expected outcomes from the requirement scenarios, API method/path, I/O, P/Q and DB
-changes. Use edit_file to create the .test.ts target under backend/tests or update test_path.
+changes. Write only the test suite at the destination in task.file_target.
+If task.file_target.path is null, choose a meaningful .test.ts filename inside
+task.file_target.directory, based on task.api_id.
+If the target does not exist, create the complete suite in one edit_file call
+using operation="create", the target path, and new_content. If read_file reports
+that the target is missing, use create; do not use replace, append, or prepend.
+If the target exists, read it first and make only a targeted edit. Do not use
+create for an existing file. After creating it, use the actual path reported by
+the tool in any later calls or imports. Do not write to any other path.
 Use { test } from node:test and assert from node:assert/strict with async test callbacks.
 Import { createApiTest, fixturePasswordHash } as needed from task.support_module with a
 relative .js ESM path. Do not import handlers, createApp, server or test aliases.
