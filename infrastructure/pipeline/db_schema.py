@@ -47,9 +47,19 @@ same response before related_fields can contain those names. If the existing ent
 is AccountSession, reuse AccountSession's exact field names instead of citing Session.
 Listing a field in related_fields does not create that entity or field.
 
+
 Store persistent business data, not transient UI values such as password confirmation.
 Derive constraints from requirement evidence; example fixture values alone do not
 establish uniqueness, normalization, value ranges or defaults.
+
+Treat a default that applies only to a form or page as UI behavior, not a database
+default or constraint, unless persistence is explicitly required.
+
+Model persistent state needed to determine whether a session is still valid. When
+a requirement says a session is invalidated on logout, define a nullable
+Session.invalidated_at datetime field and include it in related_fields for the
+session-resolution and logout requirements. A newly created or seeded active
+session has invalidated_at = null. Reuse this exact field name in later stages.
 
 Return {"entities": {...}, "related_fields": ["Entity.field"]}.
 entities is an incremental update keyed by entity name. Each new entity contains

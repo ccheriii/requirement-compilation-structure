@@ -38,6 +38,16 @@ not exercised by a step. References provide context, not inherited effects.
 Given fixtures describe existing state, not writes performed by the behavior under
 test. This includes prerequisite actions described in Given, even when those actions
 create records through the UI. Do not charge their writes to the current When action.
+
+For logout, read the session identity needed to locate the current session and
+write Session.invalidated_at to invalidate it. Do not write Session.id; it is an
+identifier, not mutable session state. Session resolution must read
+Session.invalidated_at so an invalidated session is treated as signed out.
+
+List a field as a write only when the behavior creates or changes its persisted
+value. Lookup keys and immutable identifiers are reads, not writes, unless the
+behavior explicitly changes them.
+
 Rejection and instructions to leave data unchanged do not imply writes.
 Include lookup, filter and join keys in reads, and persisted generated keys in writes.
 A field can occur in both arrays. Read/write sets describe possible behavior across

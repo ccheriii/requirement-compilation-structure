@@ -54,6 +54,10 @@ records, do not invent a separate account, password or object. The defining leaf
 will supply those records during this pass. Fill omitted mandatory fields only for records
 whose identity is actually established by this requirement.
 
+Seed only columns present in the current table DDL. For a prerequisite active
+session, leave Session.invalidated_at null. Do not reference columns that are not
+defined by the current DDL.
+
 Do not pre-execute the current When/Then. A record created by this scenario's operation
 must remain absent until that operation. Do not fabricate authenticated sessions, personal
 history, favorites or drafts that the requirement explicitly establishes through login
