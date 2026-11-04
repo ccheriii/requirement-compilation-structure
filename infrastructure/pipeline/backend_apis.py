@@ -108,6 +108,11 @@ Response bodies expose business results, not password hashes or session secrets.
 Specify success and rejection branches supported by the requirement; HTTP 501 is
 reserved for the TDD stub. Do not invent business policy or generic failure branches.
 
+Use canonical field names from the supplied schema and obligations. Declare a field
+as written only when the operation creates or changes its persisted value; lookup
+keys and immutable identifiers are not writes. Do not turn a UI-only default into
+an API or database default unless the requirement requires it.
+
 retrieved_apis contains selected canonical definitions, not the complete API inventory. The current requirement is separate. A shared API has one
 canonical interface and P/Q covering its known uses. Return a complete updated API
 when new evidence requires coordinated interface or P/Q changes; retain earlier behavior.
@@ -125,6 +130,12 @@ when a mutation API already reads the same fields. Do not use transient browser 
 as a substitute for retrieving persisted data. Given setup is not a current API mutation.
 Use requirement_apis=[] for requirements with no backend behavior and empty obligations.
 Return only API definitions and requirement associations.
+
+
+Always return both top-level keys: "apis" and "requirement_apis", including when
+either value is empty. Use only field names present in the supplied schema and
+obligations. Session resolution reads Session.invalidated_at; logout writes
+Session.invalidated_at, never Session.id.
 """
 
 

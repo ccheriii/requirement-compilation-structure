@@ -54,7 +54,17 @@ Given states in the isolated test database; still drive the current When through
 Seed additional minimal valid Given records using the documented database/test utilities. Application
 sources, shared fixtures, original requirements and other suites are not editable.
 During generation only TypeScript is checked; missing application behavior is a useful
-acceptance failure, never a reason to weaken assertions. Use edit_file to create or repair only test_path under frontend/tests/e2e/acceptance.'''
+acceptance failure, never a reason to weaken assertions. Write only the file at test_path. First check whether that exact path exists.
+If it does not exist, create it with one edit_file call using:
+path=test_path
+operation="create"
+new_content=<complete Playwright TypeScript test suite>
+Do not use replace, append, or prepend for a missing file.
+If the file already exists, read it first and make only a targeted edit using
+the appropriate edit_file operation. Do not write to any other path.
+After writing, read test_path to confirm the suite was created, then fix any
+TypeScript errors reported by the supplied check without weakening requirement
+assertions.'''
 
 REVIEW_INSTRUCTIONS = '''Review this independent acceptance test against the original requirement.
 This is a separate test review, not implementation repair. Actual failure evidence is

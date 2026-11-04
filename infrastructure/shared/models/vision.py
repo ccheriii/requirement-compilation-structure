@@ -18,12 +18,12 @@ from infrastructure.shared.models.text import DEFAULT_MODEL, JSON_OUTPUT_RULE, r
 
 VISION_INSTRUCTIONS = """Describe the supplied UI reference using visible evidence only.
 Return {"layout":"...", "elements":["..."], "style":"..."}.
-layout describes regions, alignment and relative positions; elements lists visible
-controls, labels, options and states; style describes colors, typography and spacing.
-Write descriptions in English while quoting visible labels in their original language.
-Identify illegible or uncertain details instead of inventing them. Do not infer hidden
-business behavior, APIs, database fields or interactions from appearance alone.
+layout: page regions and relative positions; elements: visible controls, exact labels,
+options and states; style: colors, typography and spacing.
+Write in English, quoting visible labels in their original language. Mark unclear
+details as uncertain. Do not infer behavior, APIs, data or interactions.
 """
+
 
 VISUAL_REPAIR_PREFIX = "Correct the previous response:\n"
 
