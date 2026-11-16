@@ -40,8 +40,27 @@ def read_file(files, path, start_line=1, end_line=None):
             (type(end_line) is not int or end_line < start_line)):
         raise FileToolError("INVALID_LINE_RANGE", "Use positive, inclusive line numbers", path)
     lines = read_source(target).splitlines(keepends=True)
-    last = min(end_line if end_line is not None else len(lines), len(lines))
-    return {"path": path, "content": "".join(lines[start_line - 1:last]), "start_line": start_line,
+    
+    # 1. Force a default maximum if end_line is omitted
+    if end_line is None:
+        last = min(start_line + 100, len(lines))
+        warning_msg = f"\n\n... [TRUNCATED] You requested the whole file. Only showing up to line {last} to conserve tokens. Read specific line ranges instead."
+    else:
+        last = min(end_line, len(lines))
+        warning_msg = ""
+        
+    # 2. Prevent the agent from requesting massive chunks (e.g. over 250 lines)
+    if (last - start_line) > 250:
+        last = start_line + 250
+        warning_msg = f"\n\n... [TRUNCATED] Requested chunk exceeds 250 lines. Only showing up to line {last} to conserve tokens."
+
+    content = "".join(lines[start_line - 1:last])
+    
+    # 3. Append the warning if the file was truncated
+    if warning_msg and last < len(lines):
+        content += warning_msg
+
+    return {"path": path, "content": content, "start_line": start_line,
         "end_line": last, "total_lines": len(lines), "writable": files.can_write(path)}
 
 

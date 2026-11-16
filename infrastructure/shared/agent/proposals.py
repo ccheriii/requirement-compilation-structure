@@ -36,7 +36,7 @@ def response_feedback(error, response):
     return feedback
 
 
-def propose_json(model, instructions, request, accept, console, label, max_attempts=10, context_index=None):
+def propose_json(model, instructions, request, accept, console, label, max_attempts=10, context_index=None, task_complexity="high"):
     """Generate and repair a proposal within a finite total model-call budget."""
     if max_attempts < 1:
         raise ValueError("--max-attempts must be positive")
@@ -56,14 +56,14 @@ def propose_json(model, instructions, request, accept, console, label, max_attem
                 prompt += "\nActual failure: " + correction["error"]
                 if correction.get("details"):
                     prompt += "\nRepair details:\n" + json.dumps(correction["details"], ensure_ascii=False, indent=2)
-            response = model.generate_json(prompt, request)
+            response = model.generate_json(prompt, request, task_complexity=task_complexity)
             while context_index is not None and isinstance(response, dict) and "context_request" in response:
                 query = response["context_request"]
                 console.show(label + " | Context query", json.dumps(query, ensure_ascii=False))
                 request["context_result"] = discovery.resolve(query)
                 request["context_records"] = discovery.evidence
                 request["context_candidates"] = discovery.candidates
-                response = model.generate_json(prompt, request)
+                response = model.generate_json(prompt, request, task_complexity=task_complexity)
             accepted = accept(response)
             checkpoint(task=label, action=f"Accept design proposal {attempt}",
                 details={"attempt": attempt, "sections": list(response) if isinstance(response, dict) else []})

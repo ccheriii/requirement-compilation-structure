@@ -49,7 +49,13 @@ class TextModel:
     def __init__(self, *, json_mode: bool = True) -> None:
         """Read compiler/.env and configure the default text model; require API credentials."""
         load_dotenv(Path(__file__).resolve().parents[3] / ".env", encoding="utf-8-sig")
-        self.name = os.getenv("MODEL") or DEFAULT_MODEL
+
+        # The heavy reasoning model for DB schema, TDD, and complex logic
+        self.heavy_model = os.getenv("MODEL") or DEFAULT_MODEL
+        
+        # The cheap, fast model for initialization, simple formatting, and basic UI
+        self.cheap_model = os.getenv("CHEAP_MODEL") or "gpt-4o-mini"
+
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("Set OPENAI_API_KEY in compiler/.env")
@@ -94,18 +100,22 @@ class TextModel:
                     continue
                 raise
 
-    def generate_json(self, instructions: str, payload: dict) -> dict:
+    def generate_json(self, instructions: str, payload: dict, task_complexity: str = "high") -> dict:
         """Request JSON using the stage prompt and serialized task data."""
+        
+        # Route to the appropriate model
+        active_model = self.cheap_model if task_complexity == "low" else self.heavy_model
+        
         mode = getattr(self, "reasoning", "low")
         try:
             response = self._request(
-                model=self.name,
+                model=active_model, # Use the routed model here instead of self.name
                 messages=[
                     {"role": "system", "content": instructions.rstrip() + "\n" + JSON_OUTPUT_RULE},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 **({"response_format": {"type": "json_object"}} if getattr(self, "json_mode", True) else {}),
-                **reasoning_arguments(self.name, mode),
+                **reasoning_arguments(active_model, mode), # Pass active_model here
             )
         except OpenAIError as error:
             raise RuntimeError(f"Text model request failed: {error}") from error
