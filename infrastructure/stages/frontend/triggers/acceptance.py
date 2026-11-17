@@ -51,8 +51,12 @@ those records when required; do not assume an empty database or insert duplicate
 Use prerequisite records to isolate the current requirement from other requirements'
 registration/creation implementations. Arrange scenario-specific absence or conflicting
 Given states in the isolated test database; still drive the current When through the UI.
-Seed additional minimal valid Given records using the documented database/test utilities. Application
-sources, shared fixtures, original requirements and other suites are not editable.
+Seed additional minimal valid Given records using the documented database/test utilities.
+Before writing SQL, inspect the supplied schema and the actual table DDL. Copy table and
+column names exactly; never guess synonyms such as agreement_accepted for
+agreement_consent. For every INSERT, supply each NOT NULL column without a SQL default,
+including required timestamps such as Session.created_at, with a valid deterministic value.
+Application sources, shared fixtures, original requirements and other suites are not editable.
 During generation only TypeScript is checked; missing application behavior is a useful
 acceptance failure, never a reason to weaken assertions. Write only to task.file_target.path,
 which is the supplied test_path. Do not call read_file to check whether a file exists.

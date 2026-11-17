@@ -22,15 +22,19 @@ from infrastructure.shared.project.git import checkpoint
 TEST_INSTRUCTIONS = """Write one HTTP acceptance suite for task.api before implementing it.
 Derive expected outcomes from the requirement scenarios, API method/path, I/O, P/Q and DB
 changes. Write only the test suite at the destination in task.file_target.
-If task.file_target.path is null, choose a meaningful .test.ts filename inside
-task.file_target.directory, based on task.api_id.
-If the target does not exist, create the complete suite in one edit_file call
-using operation="create", the target path, and new_content. If read_file reports
-that the target is missing, use create; do not use replace, append, or prepend.
-If the target exists, read it first and make only a targeted edit. Do not use
-create for an existing file. After creating it, use the actual path reported by
-the tool in any later calls or imports. Do not write to any other path.
+Use context_request only to discover semantic records or file candidates. To inspect file
+contents, call read_file with a path; do not send file paths or IDs through context_request.
+If task.test_path is null, choose a meaningful .test.ts path inside
+task.file_target.directory and create the complete suite immediately with one
+edit_file call using operation="create"; do not call read_file for a missing target.
+If task.test_path is supplied, use input.files[task.test_path].content: null means
+create that exact path; non-null means read the supplied content and make a targeted
+edit. Never use replace, append, or prepend for a missing target, or create for an
+existing file. After creation, use the actual path reported by the tool in later
+calls and imports. Do not write to any other path.
 Use { test } from node:test and assert from node:assert/strict with async test callbacks.
+Import type Database from "better-sqlite3" when annotating database helper parameters;
+use Database.Database rather than handwritten structural prepare/get signatures.
 Import { createApiTest, fixturePasswordHash } as needed from task.support_module with a
 relative .js ESM path. Do not import handlers, createApp, server or test aliases.
 
@@ -64,7 +68,16 @@ existing prerequisites instead of assuming empty tables or duplicating identitie
 scenario-specific absence/conflicting states in this isolated database. Do not invoke
 another requirement's registration/creation API to manufacture Given data.
 
-Within max_tests cover meaningful success and critical requirement-defined rejection.
+Treat max_tests as a normal-suite size target, not a hard coverage limit. Cover every
+distinct behavior branch stated by the requirement and canonical API contract: each
+success outcome, each distinct response.errors/precondition branch, and each required
+state invariant such as unchanged records on rejection or read-only behavior. Add cases
+for materially different input classes (for example missing, malformed, boundary, or
+conflicting values) only when the requirement or contract defines their behavior.
+Do not use a Cartesian product of fields; combine cases only when that preserves clear
+assertions for each distinct outcome.
+For registration, test password mismatch and every required consent rejection in the
+API contract, asserting no account/session writes and no success cookie.
 Assert relevant persisted results/forbidden writes with SQL where needed; HTTP is the
 only way to execute the operation. Do not assert unspecified wording, random identifiers,
 hashes or timestamps. Do not inspect source text, add mocks, skip/focus tests or hardcode
@@ -86,8 +99,12 @@ The export is always handle; signature.name identifies the business operation.
 Tests exercise the operation through HTTP, not through an exported test alias. Import ApiRequest and ApiResponse from backend/src/api/types.ts
 using a relative .js ESM import. Return status/body/optional headers, not Express objects.
 
-Implement request validation, API preconditions, success/rejection responses and DB
-effects according to the contract and scenarios. Use the supplied connection, parameterized
+Implement every success and error branch declared by task.api, including its response
+status, body and headers. A database or lookup failure must not be silently converted
+to a success-shaped response; return the matching declared error response and avoid
+exposing partial or stale data. Implement request validation, API preconditions,
+success/rejection responses and DB effects according to the contract and scenarios.
+Use the supplied connection, parameterized
 better-sqlite3 SQL, and transactions for related writes. Respect schema-generated integer
 keys and use node:crypto for UUIDs or hashing when the schema/contract requires them.
 Use the supplied test utilities and generated tests to understand existing fixture data
