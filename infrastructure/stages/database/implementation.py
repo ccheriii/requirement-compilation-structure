@@ -56,7 +56,10 @@ whose identity is actually established by this requirement.
 
 Seed only columns present in the current table DDL. For a prerequisite active
 session, leave Session.invalidated_at null. Do not reference columns that are not
-defined by the current DDL.
+defined by the current DDL. For each INSERT, include every DDL column marked NOT
+NULL that has no SQL default, using a minimal valid deterministic fixture value when
+the requirement does not specify one. Copy column names exactly from the DDL; do not
+guess aliases or use names from a different schema version.
 
 Do not pre-execute the current When/Then. A record created by this scenario's operation
 must remain absent until that operation. Do not fabricate authenticated sessions, personal

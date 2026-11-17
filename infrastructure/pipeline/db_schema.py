@@ -8,7 +8,11 @@ from infrastructure.utils.presentation.console import DemoConsole
 from infrastructure.utils.presentation.formatting import format_changes, format_schema
 from infrastructure.shared.rag.schema import SchemaRetriever
 from infrastructure.stages.requirements.tree import RequirementTree
-from infrastructure.stages.database.schema import apply_patch, check_related_fields
+from infrastructure.stages.database.schema import (
+    apply_patch,
+    backfill_required_field_associations,
+    check_related_fields,
+)
 from infrastructure.utils.files import save_json
 from infrastructure.shared.agent.proposals import propose_json
 from infrastructure.shared.agent.tasks import TaskFailures
@@ -51,6 +55,12 @@ Listing a field in related_fields does not create that entity or field.
 Store persistent business data, not transient UI values such as password confirmation.
 Derive constraints from requirement evidence; example fixture values alone do not
 establish uniqueness, normalization, value ranges or defaults.
+Do not invent audit timestamps such as created_at or updated_at unless required by
+the behavior or explicitly present in the requirement data. When a newly required
+non-null field is added to an entity already used by earlier requirements, treat it
+as required for every operation that creates that entity's records, not only the
+requirement that first mentions the field. The compiler carries this field into
+earlier schema associations so later obligation and API stages can account for it.
 
 Treat a default that applies only to a form or page as UI behavior, not a database
 default or constraint, unless persistence is explicitly required.
@@ -141,6 +151,7 @@ def build_db_schema(arc_dir: Path, pause: bool = False, top_k: int = 6, max_atte
             }
             def accept(patch):
                 updated = apply_patch(schema, patch)
+                backfill_required_field_associations(schema, updated)
                 check_related_fields(updated, patch["related_fields"])
                 updated["requirements"][requirement["id"]] = sorted(set(patch["related_fields"]))
                 changes = format_changes(schema, updated)
