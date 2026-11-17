@@ -112,10 +112,6 @@ Use canonical field names from the supplied schema and obligations. Declare a fi
 as written only when the operation creates or changes its persisted value; lookup
 keys and immutable identifiers are not writes. Do not turn a UI-only default into
 an API or database default unless the requirement requires it.
-When creating a record, account for every required non-null schema field in the
-operation's writes and postcondition, including internally generated values such as
-timestamps. Apply the same rule to every operation that creates the same entity.
-Use exact canonical field names; do not substitute a plausible synonym.
 
 retrieved_apis contains selected canonical definitions, not the complete API inventory. The current requirement is separate. A shared API has one
 canonical interface and P/Q covering its known uses. Return a complete updated API

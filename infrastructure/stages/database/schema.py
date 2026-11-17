@@ -28,29 +28,3 @@ def apply_patch(schema, patch):
         for field, changes in update.get("fields", {}).items():
             existing["fields"].setdefault(field, {}).update(deepcopy(changes))
     return result
-
-
-def backfill_required_field_associations(previous, updated):
-    """Make newly required fields available to earlier requirements using the entity."""
-    for entity, definition in updated["entities"].items():
-        previous_definition = previous["entities"].get(entity)
-        if previous_definition is None:
-            continue
-        previous_fields = previous_definition["fields"]
-        required_fields = {
-            f"{entity}.{field}"
-            for field, properties in definition["fields"].items()
-            if properties.get("nullable") is False
-            and (
-                field not in previous_fields
-                or previous_fields[field].get("nullable") is not False
-            )
-        }
-        if not required_fields:
-            continue
-        for requirement, related_fields in previous.get("requirements", {}).items():
-            if any(symbol.startswith(f"{entity}.") for symbol in related_fields):
-                updated["requirements"][requirement] = sorted(
-                    set(related_fields) | required_fields
-                )
-    return updated

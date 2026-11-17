@@ -61,18 +61,15 @@ def test_run_status(result):
         return "REPAIR_REQUIRED"
 
 
-TEST_INSTRUCTIONS = """Write a focused Playwright functional suite for the CURRENT requirement.
+TEST_INSTRUCTIONS = """Write a small Playwright functional smoke suite for the CURRENT requirement.
 The goal is to verify that real UI input reaches the backend API and its result is
 reflected in the application. Backend contract details were already tested in step 06;
 UI presentation was already tested in step 08.
 
-Cover each distinct user-visible scenario outcome required by this requirement, including
-success and each materially different critical rejection, identity/ownership, or
-refresh/persistence behavior where specified. Treat max_tests as a typical suite-size
-target, not a hard cap; exceed it when needed to preserve distinct required outcomes.
-Do not enumerate a Cartesian product of fields or test unspecified policies. A single
-test may cover a sequential workflow when that keeps each assertion clear, but do not
-omit a distinct Given/When/Then behavior merely to meet a test-count target.
+Normally write one primary successful workflow. Add a second case only for a critical
+business rejection or anonymous state required by this requirement. Stay within max_tests;
+do not fill the quota with field combinations or exhaustive branches. A successful
+workflow may include navigation and reload when those are part of this requirement.
 Destination pages and their mount triggers are supporting context, not instructions
 to test other requirements' registration, login or logout workflows in this suite.
 Use concrete URLs and object identities from the requirement's workflow and actual

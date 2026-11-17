@@ -1,18 +1,14 @@
 """Sequential schema updates define every field before requirement associations use it."""
 
 from copy import deepcopy
+from importlib import import_module
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from infrastructure.pipeline import db_obligations, db_schema
-from infrastructure.stages.database.schema import (
-    apply_patch,
-    backfill_required_field_associations,
-    check_related_fields,
-)
+from infrastructure.stages.database.schema import apply_patch, check_related_fields
 from infrastructure.utils.files import save_json
 
 
@@ -43,29 +39,6 @@ class SchemaEvolution(unittest.TestCase):
         self.assertEqual(extended['entities']['Session']['fields']['id'], field('Session ID'))
         self.assertNotIn('token', updated['entities']['Session']['fields'])
 
-    def test_new_required_field_is_associated_with_earlier_requirements_for_entity(self):
-        baseline = {
-            'entities': {'Session': {'fields': {'id': field('Session ID')}}},
-            'requirements': {
-                'REQ-1': ['Session.id'],
-                'REQ-2': ['Session.id'],
-                'REQ-3': ['Account.id'],
-            },
-        }
-        patch_record = {
-            'entities': {'Session': {'fields': {'created_at': field('Creation time')}}},
-            'related_fields': ['Session.id', 'Session.created_at'],
-        }
-
-        updated = backfill_required_field_associations(
-            baseline, apply_patch(baseline, patch_record)
-        )
-
-        self.assertEqual(updated['requirements']['REQ-1'], ['Session.created_at', 'Session.id'])
-        self.assertEqual(updated['requirements']['REQ-2'], ['Session.created_at', 'Session.id'])
-        self.assertEqual(updated['requirements']['REQ-3'], ['Account.id'])
-        self.assertEqual(baseline['requirements']['REQ-1'], ['Session.id'])
-
     def test_undefined_entity_field_and_synonym_are_rejected_with_repair_instructions(self):
         bad, fixed = self.proposals()
         with self.assertRaisesRegex(ValueError, 'Session.account_id, Session.id'):
@@ -76,6 +49,8 @@ class SchemaEvolution(unittest.TestCase):
                 check_related_fields(updated, [missing])
 
     def test_bad_stage02_proposal_is_repaired_before_next_requirement_and_stage03(self):
+        stage2 = import_module('02_build_db_schema')
+        stage3 = import_module('03_infer_db_obligations')
         bad, fixed = self.proposals()
         with TemporaryDirectory() as temporary:
             arc = Path(temporary)
@@ -96,26 +71,27 @@ class SchemaEvolution(unittest.TestCase):
                 self.assertEqual(request['requirement']['id'], 'REQ-2')
                 self.assertEqual(set(request['symbol_inventory']), {'Account', 'Session'})
                 return {'entities': {}, 'related_fields': ['Account.id', 'Session.id']}
-            with patch.object(db_schema, 'TextModel', return_value=Mock(generate_json=generate)), patch.object(db_schema, 'DemoConsole', return_value=Mock()):
-                schema = db_schema.build_db_schema(arc, max_attempts=2)
+            with patch.object(stage2, 'TextModel', return_value=Mock(generate_json=generate)), patch.object(stage2, 'DemoConsole', return_value=Mock()):
+                schema = stage2.build_db_schema(arc, max_attempts=2)
             self.assertEqual(len(requests), 3)
             self.assertEqual(schema['requirements']['REQ-1'], sorted(fixed['related_fields']))
             self.assertEqual(json.loads((arc / 'db_schema.json').read_text()), schema)
             inference = Mock(generate_json=Mock(return_value={'requirement': {'read': ['Session.id'], 'write': []}, 'steps': {}}))
-            with patch.object(db_obligations, 'TextModel', return_value=inference), patch.object(db_obligations, 'DemoConsole', return_value=Mock()):
-                result = db_obligations.infer_db_obligations(arc)
+            with patch.object(stage3, 'TextModel', return_value=inference), patch.object(stage3, 'DemoConsole', return_value=Mock()):
+                result = stage3.infer_db_obligations(arc)
             self.assertEqual(inference.generate_json.call_count, 2)
             self.assertEqual(result['requirements']['REQ-1']['read'], ['Session.id'])
 
     def test_legacy_invalid_artifact_has_clear_error_before_model_request(self):
+        stage3 = import_module('03_infer_db_obligations')
         with TemporaryDirectory() as temporary:
             arc = Path(temporary)
             save_json(arc / 'requirements.json', {'id': 'ROOT', 'children': [{'id': 'REQ-1', 'name': 'Home'}]})
             save_json(arc / 'db_schema.json', {'entities': {}, 'requirements': {'REQ-1': ['Session.id']}})
             model = Mock()
-            with patch.object(db_obligations, 'TextModel', return_value=model), patch.object(db_obligations, 'DemoConsole', return_value=Mock()), self.assertRaises(RuntimeError) as failure:
-                db_obligations.infer_db_obligations(arc)
-            self.assertIn('Rerun main.py --stage 02', failure.exception.failures[0]['error'])
+            with patch.object(stage3, 'TextModel', return_value=model), patch.object(stage3, 'DemoConsole', return_value=Mock()), self.assertRaises(RuntimeError) as failure:
+                stage3.infer_db_obligations(arc)
+            self.assertIn('Rerun 02_build_db_schema.py', failure.exception.failures[0]['error'])
             self.assertEqual(failure.exception.failures[0]['task'], 'REQ-1')
             model.generate_json.assert_not_called()
 

@@ -39,12 +39,6 @@ Given fixtures describe existing state, not writes performed by the behavior und
 test. This includes prerequisite actions described in Given, even when those actions
 create records through the UI. Do not charge their writes to the current When action.
 
-When a behavior creates a record, include every required non-null field supplied by
-the related schema in writes, even when its value is generated internally rather than
-entered by the user. This includes required timestamps and foreign keys. Apply this to
-every creation flow for a shared entity: for example, registration and login both
-create Session rows, so each must account for every required Session field.
-
 For logout, read the session identity needed to locate the current session and
 write Session.invalidated_at to invalidate it. Do not write Session.id; it is an
 identifier, not mutable session state. Session resolution must read
