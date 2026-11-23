@@ -1,6 +1,7 @@
 """Isolate failed design tasks while preserving successful neighboring artifacts."""
 
 from contextlib import contextmanager
+import errno
 
 
 class StageIncomplete(RuntimeError):
@@ -22,7 +23,9 @@ class TaskFailures:
         try:
             yield
         except Exception as error:
-            if isinstance(error, OSError):
+            # Only resource exhaustion ends the stage; other OS errors (for example a file
+            # locked by another process) fail this task and the remaining tasks continue.
+            if isinstance(error, MemoryError) or getattr(error, "errno", None) == errno.ENOSPC:
                 raise
             self.report['tasks'][identity] = {'status': 'FAILED', 'error': str(error),
                 'error_type': type(error).__name__}

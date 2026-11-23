@@ -11,6 +11,8 @@ from infrastructure.utils.presentation.formatting import format_schema
 from infrastructure.utils.presentation.formatting import format_obligations
 from infrastructure.stages.requirements.tree import RequirementTree
 from infrastructure.utils.files import save_json
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from infrastructure.shared.agent.proposals import propose_json
 from infrastructure.shared.agent.tasks import TaskFailures
 from infrastructure.shared.agent.discovery import ContextIndex
@@ -50,6 +52,9 @@ returning data from a create operation does not replace a later retrieval operat
 """
 
 
+PARALLEL_INFERENCE = 8
+
+
 def infer_db_obligations(arc_dir: Path, pause: bool = False, top_k: int = 6, max_attempts: int = 10) -> dict:
     for filename, previous in (("requirements.json", "main.py --stage 01"), ("db_schema.json", "main.py --stage 02")):
         if not (arc_dir / filename).is_file():
@@ -69,7 +74,7 @@ def infer_db_obligations(arc_dir: Path, pause: bool = False, top_k: int = 6, max
 
     failures = TaskFailures(arc_dir, "03_infer_db_obligations", console)
     save_json(arc_dir / "db_obligations.json", obligations)
-    for index, rid in enumerate(tree.leaves, 1):
+    def infer(index, rid):
         with failures.task(rid):
             requirement = tree.requirements[rid]
             label = f"{index}/{len(tree.leaves)} {rid}"
@@ -109,11 +114,25 @@ def infer_db_obligations(arc_dir: Path, pause: bool = False, top_k: int = 6, max
 
             (inferred, summary), _ = propose_json(model, INSTRUCTIONS, request, accept,
                 console, f"Obligation inference {rid}", max_attempts, context_index=ContextIndex(lambda: {"schema": schema["entities"]}))
-            obligations["requirements"][rid] = inferred["requirement"]
-            obligations["steps"].update(inferred["steps"])
-            save_json(arc_dir / "db_obligations.json", obligations)
-            console.artifact("db_obligations", obligations, f"{label} | Accepted obligations")
-            console.show(f"{label} | 4. Inferred obligations", summary)
+            results[rid] = (inferred, summary, label)
+
+    # Leaves are independent here (fixed schema, per-leaf outputs): infer concurrently, each in a
+    # copy of the logging context, then merge and publish deterministically in leaf order.
+    results = {}
+    with ThreadPoolExecutor(max_workers=PARALLEL_INFERENCE) as pool:
+        futures = [pool.submit(copy_context().run, infer, index, rid)
+            for index, rid in enumerate(tree.leaves, 1)]
+        for future in futures:
+            future.result()
+    for rid in tree.leaves:
+        if rid not in results:
+            continue
+        inferred, summary, label = results[rid]
+        obligations["requirements"][rid] = inferred["requirement"]
+        obligations["steps"].update(inferred["steps"])
+        console.artifact("db_obligations", obligations, f"{label} | Accepted obligations")
+        console.show(f"{label} | 4. Inferred obligations", summary)
+    save_json(arc_dir / "db_obligations.json", obligations)
 
     failures.finish()
     obligations = normalize_obligations(obligations, tree)

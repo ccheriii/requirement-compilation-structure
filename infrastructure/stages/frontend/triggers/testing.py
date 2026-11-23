@@ -5,6 +5,7 @@ import os
 import re
 from tempfile import TemporaryDirectory
 
+from infrastructure.stages.frontend.browser import browser_available, unverified_result
 from infrastructure.stages.frontend.triggers.e2e_runtime import RUNNER
 from infrastructure.stages.frontend.ui.testing import FrontendChecks, parse_playwright_result
 from infrastructure.shared.project.entrypoints import selected_path
@@ -32,15 +33,23 @@ class E2EChecks(FrontendChecks):
             source_files=("src/**/*.ts", "src/**/*.tsx") if full_source else ())
 
     def tests(self, files):
-        """Run selected E2E specs and keep startup/runner failures available for repair."""
+        """Run selected E2E specs and keep startup/runner failures available for repair.
+
+        Every invocation starts the servers on a new database seeded at startup, so
+        supplied (fixture-free) specs must run in their own invocation, never mixed
+        with fixture-based suites that reset data before each test."""
         if not files:
             raise ValueError("Do not run empty E2E suites")
+        if not browser_available():
+            return unverified_result(files)
         for relative in files:
             if not (self.output / relative).resolve().is_relative_to(self.output / "frontend/tests/e2e"):
                 raise ValueError("Run only the selected E2E test suites")
         # The Node runner creates a child directory here. Python also removes
         # it after timeout/interruption, so test databases never persist.
-        with TemporaryDirectory(prefix="arc-e2e-owner-") as temporary:
+        # Windows may still hold the SQLite file briefly after the server exits;
+        # a failed cleanup of a temporary directory must not fail the check.
+        with TemporaryDirectory(prefix="arc-e2e-owner-", ignore_cleanup_errors=True) as temporary:
             env = {**os.environ, "ARC_E2E_TEMP_ROOT": temporary}
             print("Playwright E2E | real backend + isolated database | " + ", ".join(files), flush=True)
             try:

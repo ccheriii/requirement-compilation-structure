@@ -22,3 +22,17 @@ def seed_source(table_order: list[str]) -> str:
     marker = "export const seedFiles: readonly string[] = [];"
     files = [name + ".sql" for name in table_order]
     return source.replace(marker, "export const seedFiles: readonly string[] = " + json.dumps(files, indent=2) + ";")
+
+
+PASSWORD_PATH = "backend/src/db/password.ts"
+
+
+def ensure_password_module(output: Path) -> str:
+    """Publish the compiler-owned password module when an older workspace lacks it."""
+    target = Path(output).resolve() / PASSWORD_PATH
+    if not target.is_file():
+        template = Path(__file__).resolve().parents[2] / "shared/project/templates" / PASSWORD_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(template.read_text(encoding="utf-8-sig"))
+    return PASSWORD_PATH

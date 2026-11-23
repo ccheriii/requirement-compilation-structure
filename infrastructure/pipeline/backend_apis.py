@@ -107,6 +107,30 @@ state any shared credential/cookie convention consistently across related APIs.
 Response bodies expose business results, not password hashes or session secrets.
 Specify success and rejection branches supported by the requirement; HTTP 501 is
 reserved for the TDD stub. Do not invent business policy or generic failure branches.
+Request schemas use type, required and enum; add pattern, format, minLength or maxLength
+only when the requirement text states that rule. Hints, examples or rule links shown in
+reference images are not validation rules. Unless a stated rule restricts them, free-text
+identity values (names, usernames, document numbers) accept hyphens, digits and mixed case.
+
+Default session convention when requirements involve sign-in state, unless they state
+otherwise (record the cookie name in conventions):
+- Sign-in/registration that signs the user in creates an opaque random token (for example
+  32 random bytes as hex) stored in a persistent session table that references the
+  account; never in memory and never a value derived from the user's identity.
+- Response header set-cookie: NAME=TOKEN; Path=/; HttpOnly; SameSite=Lax, with NO Secure
+  flag (the application is served over plain http) and no short Max-Age/Expires, so the
+  session survives page reloads.
+- A read-only current-user GET endpoint returns 200 with an explicit signed-out body
+  (for example {"authenticated": false, "user": null}) for a missing, unknown or
+  invalidated token, and 200 with the public user fields when signed in. It never answers
+  401/500 for a signed-out visitor and never creates, extends or deletes records.
+- Logout deletes the server-side session row for the presented token and clears the
+  cookie with the same name and Path=/ plus Max-Age=0; it succeeds even when already
+  signed out. Afterwards the old token resolves as signed out.
+When a credential/lookup field's required label names several identifier kinds (for
+example "Email/Username/Mobile number"), the operation resolves the account by an exact
+match on ANY of those identifiers that the schema stores, in the listed order. This is an
+accepted alias of the stated identifier, not new policy.
 
 retrieved_apis contains selected canonical definitions, not the complete API inventory. The current requirement is separate. A shared API has one
 canonical interface and P/Q covering its known uses. Return a complete updated API

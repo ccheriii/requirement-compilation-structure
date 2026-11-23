@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from infrastructure.stages.database.order import implementation_groups, table_dependencies
-from infrastructure.stages.database.runtime import initializer_source
+from infrastructure.stages.database.runtime import initializer_source, ensure_password_module
 from infrastructure.shared.models.text import TextModel
 from infrastructure.utils.presentation.console import DemoConsole
 from infrastructure.utils.presentation.formatting import format_schema
@@ -49,7 +49,9 @@ SQL files in a transaction. Preserve existing data through IF NOT EXISTS.
 """
 
 
-def implement_db(arc_dir: Path, pause: bool = False, max_attempts: int = 10, max_turns: int = 10) -> dict:
+def implement_db(arc_dir: Path, pause: bool = False, max_attempts: int = 10, max_turns: int = 10,
+        input_dir: Path | None = None) -> dict:
+    """input_dir is optional; when omitted, startup data recovers it from the stage-01 record."""
     if max_turns < 1:
         raise ValueError("--max-turns must be positive")
     source = arc_dir / "db_schema.json"
@@ -61,6 +63,8 @@ def implement_db(arc_dir: Path, pause: bool = False, max_attempts: int = 10, max
             raise ValueError("Run main.py --stage 00 first to initialize the project structure")
     schema = json.loads(source.read_text(encoding="utf-8-sig"))
     console = DemoConsole(pause)
+    # seed.ts and the backend test helper import the shared password module.
+    ensure_password_module(output_dir)
     # --- Extension point 04B: dependency-aware table implementation -----------
     # Referenced tables precede dependents. Cyclic groups use forward references;
     # available implementations and unresolved target definitions remain explicit.
@@ -134,7 +138,8 @@ def implement_db(arc_dir: Path, pause: bool = False, max_attempts: int = 10, max
     print(f"Database initialization wired: {initializer}", flush=True)
     if order:
         # Revisit requirements after DDL: preserve and extend each table's prerequisite rows.
-        implement_startup_data(arc_dir, schema, model, console, failures, max_attempts)
+        implement_startup_data(arc_dir, schema, model, console, failures, max_attempts,
+            input_dir=Path(input_dir).resolve() if input_dir is not None else None)
     with failures.task("database runtime"):
         verified = verify_database_runtime(arc_dir, schema, model, console, max_turns)
         # The runtime owner can repair tables whose initial generation failed.

@@ -20,6 +20,8 @@ from infrastructure.utils.presentation.logging import full_detail, session_info
 
 _activity = ContextVar("compiler_activity", default="Model request")
 _render_lock = RLock()
+_spinning = False  # one animated waiting spinner at a time; parallel waits print a line instead
+HEARTBEAT_SECONDS = 60.0
 _COLORS = {"info": "cyan", "input": "blue", "output": "magenta", "success": "green", "waiting": "yellow", "error": "red"}
 
 
@@ -77,8 +79,10 @@ def show_panel(title: str, body, tone: str = "info", max_lines: int = 30, max_ch
     if isinstance(body, str):
         body = Text(preview(body, max_lines=max_lines, max_chars=max_chars))
     style = _COLORS.get(tone, "cyan")
-    panel = Panel(Group(Text(title, style="bold " + style), Rule(style=style), body),
-        border_style=style, box=box.SQUARE, padding=(0, 1), expand=True)
+    # Headless log viewers get plain ASCII frames (no ANSI, no box-drawing glyphs).
+    frame = box.SQUARE if sys.stdout.isatty() else box.ASCII
+    panel = Panel(Group(Text(title, style="bold " + style), Rule(style=style, characters="─" if sys.stdout.isatty() else "-"), body),
+        border_style=style, box=frame, padding=(0, 1), expand=True)
     with _render_lock:
         rich_console().print(panel)
 
@@ -103,7 +107,13 @@ class WaitingStatus:
         self.progress = None
         message = "[WAITING] Waiting for model response..."
         terminal = getattr(sys.stdout, "terminal", sys.stdout)
-        if sys.stdout.isatty():
+        global _spinning
+        with _render_lock:
+            # Parallel model calls share one terminal: animate only one spinner at a time.
+            animate = sys.stdout.isatty() and not _spinning
+            if animate:
+                _spinning = True
+        if animate:
             session = session_info()
             if session:
                 with session["lock"]:
@@ -118,14 +128,34 @@ class WaitingStatus:
             self.progress.start()
         else:
             print(message, flush=True)
+            self._start_heartbeat()
+
+    def _start_heartbeat(self) -> None:
+        """Without a spinner, print a progress line every HEARTBEAT_SECONDS of a long wait so
+        hosted log viewers show the compiler is alive (model calls can take minutes)."""
+        import threading
+        from time import monotonic
+        self._stop = threading.Event()
+        activity, started = current_activity(), monotonic()
+
+        def beat():
+            while not self._stop.wait(HEARTBEAT_SECONDS):
+                print(f"[WAITING] still waiting for model response ({monotonic() - started:.0f}s) | {activity}",
+                    flush=True)
+        threading.Thread(target=beat, name="model-wait-heartbeat", daemon=True).start()
 
     def close(self) -> None:
+        stop = getattr(self, "_stop", None)
+        if stop is not None:
+            stop.set()
         with _render_lock:
             if self.closed:
                 return
             self.closed = True
             if self.progress is not None:
+                global _spinning
                 self.progress.stop()
+                _spinning = False
 
 
 class DemoConsole:

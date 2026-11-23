@@ -14,6 +14,13 @@ when uncertain. Existing conventions stay unchanged unless explicit requirement 
 requires a coordinated correction. Before changing one, query the affected API contracts
 and relevant source requirement scenarios; preserve earlier accepted behavior. Return only
 new or deliberately revised conventions, or omit conventions when no change is needed.
+A session convention, unless requirements state otherwise, records: the cookie name; an
+opaque random token persisted in a session table; set-cookie attributes Path=/; HttpOnly;
+SameSite=Lax without Secure and without a short Max-Age; the read-only current-user
+endpoint answering 200 with an explicit signed-out body for missing/unknown tokens; and
+logout deleting the session row and clearing the cookie with Path=/ and Max-Age=0.
+Passwords are stored and verified only through backend/src/db/password.ts
+(hashPassword/verifyPassword); do not define another hashing convention.
 Application/test implementation tasks may read these decisions, but do not own their edits.'''
 
 

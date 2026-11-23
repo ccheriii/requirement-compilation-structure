@@ -1,6 +1,8 @@
 """Run all compilation passes or one selected pass in the same pipeline."""
 
 from pathlib import Path
+import shutil
+import time
 import traceback
 
 from infrastructure.pipeline.project_initialization import project_initialization
@@ -34,11 +36,55 @@ PIPELINE = (
     ("10_implement_frontend_tdd", implement_frontend_triggers, "frontend_e2e"),
 )
 
+# Kept when a full compilation starts over in an existing output directory: installed
+# packages make reruns fast, and git history/logs are audit evidence, not generated state.
+PRESERVED_NAMES = {".git", "node_modules", "package-lock.json", "compiler.log", "model_calls.jsonl"}
+
+
+def _remove(path: Path) -> bool:
+    """Delete a file or tree, retrying briefly for Windows/OneDrive locks; report failure instead of raising."""
+    for attempt in range(5):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            return True
+        except OSError:
+            time.sleep(0.2 * (attempt + 1))
+    return False
+
+
+def reset_output(output_dir: Path) -> list[str]:
+    """Remove generated sources and artifacts from a previous compilation.
+
+    Stage 00 deliberately never overwrites existing files, so without this a full rerun
+    inherits stale handlers, routes, tests and .arc path records from earlier designs.
+    Returns workspace-relative paths that could not be removed (for example a locked DB).
+    """
+    leftovers = []
+
+    def clean(directory: Path) -> None:
+        for child in directory.iterdir():
+            if child.name in PRESERVED_NAMES:
+                continue
+            if child.is_dir() and not child.is_symlink() and any(
+                    (child / name).exists() for name in ("node_modules",)):
+                clean(child)  # workspace folders such as frontend/ keep their node_modules
+                continue
+            if not _remove(child):
+                leftovers.append(child.relative_to(output_dir).as_posix())
+
+    if output_dir.is_dir():
+        clean(output_dir)
+    return leftovers
+
+
 class Compiler:
     """Own shared paths, configuration, and results for one compilation."""
 
     def __init__(self, input_dir: Path, output_dir: Path, model_log: bool = False,
-            port: int = 3000, pause: bool = False) -> None:
+            port: int = 3000, pause: bool = False, keep_output: bool = False) -> None:
         if not 1 <= port <= 65535:
             raise ValueError("Backend port must be between 1 and 65535")
         self.input_dir = Path(input_dir).expanduser().resolve()
@@ -47,6 +93,7 @@ class Compiler:
         self.model_log = model_log
         self.port = port
         self.pause = pause
+        self.keep_output = keep_output
         self.artifacts: dict[str, object] = {}
         self.current_stage: str | None = None
         self.report = {"status": "NOT_STARTED", "stages": {}}
@@ -96,6 +143,13 @@ class Compiler:
                 raise ValueError(f"Unknown stage: {stage}. Use a full stage name such as 06_implement_backend_tdd.")
         self.artifacts.clear()
         self.report = {"status": "RUNNING", "stages": {}}
+        if stage is None and not self.keep_output and (self.arc_dir.exists() or (self.output_dir / "backend").exists()):
+            leftovers = reset_output(self.output_dir)
+            show_panel("Requirement compiler | Fresh output",
+                "Removed generated sources and .arc artifacts from the previous compilation "
+                "(kept node_modules, package-lock.json, git history and logs). Use --keep-output to reuse them."
+                + ("\nCould not remove (locked?): " + ", ".join(leftovers) if leftovers else ""),
+                tone="error" if leftovers else "info")
         show_panel("Requirement compiler | Pipeline",
             f"Input: {self.input_dir}\nOutput: {self.output_dir}\nPasses: {len(passes)}\nDetailed model logs: {'enabled' if self.model_log else 'disabled'}")
         for name, function, artifact in passes:
@@ -104,6 +158,8 @@ class Compiler:
             elif function in (explore_requirement, design_frontend_ui, implement_frontend_ui,
                     design_frontend_triggers, implement_frontend_triggers):
                 result = self._run(name, function, self.input_dir, self.arc_dir, pause=self.pause)
+            elif function is implement_db:
+                result = self._run(name, function, self.arc_dir, pause=self.pause, input_dir=self.input_dir)
             else:
                 result = self._run(name, function, self.arc_dir, pause=self.pause)
             self.artifacts[artifact] = result

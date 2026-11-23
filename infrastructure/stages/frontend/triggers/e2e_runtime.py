@@ -12,6 +12,9 @@ CONFIG = "frontend/playwright.e2e.config.ts"
 FIXTURE = "frontend/tests/e2e/support/context.ts"
 RUNNER = "frontend/scripts/test-e2e.mjs"
 VITE_CONFIG = "frontend/vite.e2e.config.ts"
+# Production-mode acceptance: built backend serves frontend/dist on one origin, like a grader.
+PROD_CONFIG = "frontend/playwright.prod.config.ts"
+PROD_BASE_URL_ENV = "ARC_PROD_BASE_URL"
 
 CONFIG_SOURCE = '''import { defineConfig } from "@playwright/test";
 const frontendPort = process.env.ARC_E2E_FRONTEND_PORT;
@@ -21,7 +24,8 @@ if (!frontendPort || !backendPort || !database) throw new Error("Use npm run tes
 export default defineConfig({
   testDir: "./tests/e2e", outputDir: "./test-results/e2e", workers: 1,
   fullyParallel: false, retries: 0, forbidOnly: true,
-  timeout: 30000, expect: { timeout: 5000 }, reporter: "json",
+  // The external grader allows 10s per test; dev mode adds Vite's on-demand compile.
+  timeout: 15000, expect: { timeout: 5000 }, reporter: "json",
   use: { baseURL: `http://127.0.0.1:${frontendPort}`, browserName: "chromium", headless: true,
     trace: "retain-on-failure", screenshot: "only-on-failure" },
   webServer: [
@@ -34,6 +38,20 @@ export default defineConfig({
       ...(process.platform === "win32" ? {} : { gracefulShutdown: { signal: "SIGTERM" as const, timeout: 3000 } }),
       env: { ARC_BACKEND_URL: `http://127.0.0.1:${backendPort}` } },
   ],
+});
+'''
+
+PROD_CONFIG_SOURCE = '''// Compiler-owned production acceptance config. Specs run against the built server
+// (node backend/dist/server.js) started by the compiler with a fresh database.
+import { defineConfig } from "@playwright/test";
+const baseURL = process.env.ARC_PROD_BASE_URL;
+if (!baseURL) throw new Error("ARC_PROD_BASE_URL is required; the compiler starts the production server");
+export default defineConfig({
+  testDir: "./tests/e2e/supplied", outputDir: "./test-results/prod", workers: 1,
+  fullyParallel: false, retries: 0, forbidOnly: true,
+  // Same per-test budget as the external grader (10s), so slow flows fail here first.
+  timeout: 10000, expect: { timeout: 5000 }, reporter: "json",
+  use: { baseURL, browserName: "chromium", headless: true },
 });
 '''
 

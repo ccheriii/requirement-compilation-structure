@@ -48,6 +48,16 @@ uv run main.py input --output-dir outputs/demo
 
 Add `--model-log` to display and save detailed model input/output, or `--port 33000` to change the backend port (default: 3000). Token usage and model latency are always shown.
 
+A full run into an existing output directory starts fresh: generated sources and `.arc/` artifacts from the previous compilation are removed (installed `node_modules`, `package-lock.json`, git history and logs are kept, so reruns stay fast). Stale handlers, routes and tests from an earlier design otherwise shadow the new ones. Pass `--keep-output` to reuse them instead. Single-stage runs (`--stage`) never reset the output.
+
+If the input directory contains Playwright specs under `tests/` (for example `input/tests/REQ-2.spec.ts`), stage 10 installs them read-only into `frontend/tests/e2e/supplied/` and repairs the application until they pass, then reruns them against the production build (`npm run build`, built server, fresh database), the same way a grader does.
+
+To grade any generated application against the input specs:
+
+```bash
+uv run scripts/acceptance.py outputs/demo
+```
+
 ### Step by step
 
 Run these commands in order to execute the same 11 passes as the full pipeline. Each command runs only the selected stage and reads existing artifacts from `outputs/demo/.arc/`.

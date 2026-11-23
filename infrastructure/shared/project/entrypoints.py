@@ -3,6 +3,7 @@
 import posixpath
 from pathlib import Path, PurePosixPath
 import json
+from threading import RLock
 
 from infrastructure.utils.paths import check_path_case
 from infrastructure.utils.files import save_json
@@ -12,19 +13,25 @@ FILE_ROOTS = {"api": "backend/src", "page": "frontend/src", "trigger": "frontend
     "backend_test": "backend/tests", "e2e_test": "frontend/tests/e2e"}
 
 
+# Parallel test generation reads and updates the shared path index from worker threads.
+_INDEX_LOCK = RLock()
+
+
 def selected_path(output: Path, kind: str, identity: str) -> str | None:
     """Read the implementation path selected for a model ID."""
     index = output / ".arc/implementation_paths.json"
-    paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
+    with _INDEX_LOCK:
+        paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
     return paths.get(kind, {}).get(identity)
 
 
 def remember_path(output: Path, kind: str, identity: str, relative: str) -> None:
     """Persist the implementation path for a target without model response metadata."""
     index = output / ".arc/implementation_paths.json"
-    paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
-    paths.setdefault(kind, {})[identity] = relative
-    save_json(index, paths)
+    with _INDEX_LOCK:
+        paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
+        paths.setdefault(kind, {})[identity] = relative
+        save_json(index, paths)
 
 
 def implementation_entrypoint(output: Path, kind: str, identity: str) -> dict | None:

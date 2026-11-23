@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from threading import RLock
 
 
 IGNORE_RULES = (
@@ -125,7 +126,16 @@ def initialize_repository(output):
         return None
 
 
+_CHECKPOINT_LOCK = RLock()
+
+
 def checkpoint(output=None, *, stage=None, task, action, status="GREEN", details=None):
+    """Record a semantic step; serialized so concurrent model tasks never race on the git index."""
+    with _CHECKPOINT_LOCK:
+        return _checkpoint(output, stage=stage, task=task, action=action, status=status, details=details)
+
+
+def _checkpoint(output=None, *, stage=None, task, action, status="GREEN", details=None):
     """Record a semantic step, including no-change checks, without hiding build failures."""
     from infrastructure.utils.presentation.logging import session_info
     session = session_info()

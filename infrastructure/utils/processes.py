@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import tempfile
 from time import monotonic
 
 WINDOWS = os.name == "nt"
@@ -53,17 +54,40 @@ def stop_process(process) -> None:
     process.wait(timeout=5)
 
 
+def _captured_text(stream) -> str:
+    """Decode captured bytes as UTF-8 with universal newlines, like text-mode pipes."""
+    stream.flush()
+    stream.seek(0)
+    text = stream.read().decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def capture_process(command, *, cwd, timeout, env=None) -> dict:
-    """Capture UTF-8 output and clean the whole process tree before re-raising timeout or Ctrl+C."""
+    """Capture UTF-8 output and clean the whole process tree before re-raising timeout or Ctrl+C.
+
+    Output goes to temporary files rather than pipes and completion is judged by the
+    process exit: a descendant that inherited the handles (a server or browser left by a
+    test runner, common on Windows) can no longer block the capture until the timeout.
+    """
     started = monotonic()
-    process = start_process(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except BaseException:
-        stop_process(process)
-        process.communicate(timeout=5)
-        raise
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = start_process(command, cwd=cwd, env=env, stdout=out, stderr=err)
+        try:
+            process.wait(timeout=timeout)
+        except BaseException:
+            try:
+                stop_process(process)
+            except Exception as cleanup:  # keep the timeout/interrupt as the reported error
+                print(f"[CHECK] process cleanup failed: {cleanup}", flush=True)
+            raise
+        if not WINDOWS:
+            # The command has exited; end descendants it left in its owned process group
+            # (pipes used to keep the capture waiting on them until the timeout cleanup).
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        stdout, stderr = _captured_text(out), _captured_text(err)
     elapsed = monotonic() - started
     label = " ".join([Path(str(command[0])).name, *(str(part) for part in command[1:])])
     print(f"[CHECK] {label} | {elapsed:.2f} s | exit {process.returncode}", flush=True)

@@ -9,16 +9,26 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 
-from infrastructure.stages.frontend.ui.design import data_symbols, page_elements, visible
+from infrastructure.stages.frontend.browser import (browser_available, browser_state, is_unverified,
+    set_browser_state, unverified_result)
+from infrastructure.stages.frontend.ui.design import (accessible_name, accessible_role, data_symbols,
+    option_names, page_elements, semantic_scope, visible)
 from infrastructure.utils.processes import capture_process, npm_command
 
-KEY_TYPES = {"page", "form", "input", "checkbox", "select", "button", "heading", "link", "list", "image", "alert", "table", "text"}
+KEY_TYPES = {"page", "form", "input", "textarea", "checkbox", "select", "radiogroup", "button", "heading",
+    "link", "list", "image", "alert", "table", "text"}
+# The version suffix lets step 08 replace compiler-owned suites written by an older generator.
+SUITE_PREFIX = "// Compiler-owned presence tests"
+SUITE_HEADER = SUITE_PREFIX + " v2. Display values belong to this suite only."
 
 
 def presentation_run_status(result):
     """Repair existing page runtime failures; only assertion failures establish valid RED."""
+    if is_unverified(result):
+        return "UNVERIFIED"
     if result["returncode"] == 0:
         require_green(result)
         return "GREEN"
@@ -32,6 +42,129 @@ def presentation_run_status(result):
 def test_path(pid: str) -> str:
     """Return a stable, filesystem-safe Playwright spec path for a page ID."""
     return f"frontend/tests/ui/{pid}.spec.ts"
+
+
+def stale_compiler_suite(existing: str) -> bool:
+    """Return whether an existing suite is compiler-owned but written by another generator version."""
+    first = existing.lstrip("\ufeff").split("\n", 1)[0].rstrip("\r")
+    return first.startswith(SUITE_PREFIX) and first != SUITE_HEADER
+
+
+def static_href(prop: dict) -> str | None:
+    """Return a literal application path suitable for an href assertion."""
+    href = prop.get("href")
+    if isinstance(href, str) and href.startswith("/") and not any(mark in href for mark in (":", "*", "{", "[")):
+        return href
+    return None
+
+
+def accessible_contract(design: dict, pid: str) -> list[dict]:
+    """List the page's functional controls with the role/name pairs that tests and graders use."""
+    contract = []
+    for uid, node in page_elements(design, pid).items():
+        role, name = accessible_role(node), accessible_name(node)
+        scope = semantic_scope(design, uid)
+        if role is None or name is None or scope == "decorative":
+            continue
+        prop = node.get("prop") if isinstance(node.get("prop"), dict) else {}
+        entry = {"id": uid, "role": "textbox (type=password, located by label)" if role == "password" else role,
+            "name": name}
+        for key in ("input_type", "placeholder"):
+            if isinstance(prop.get(key), str):
+                entry[key] = prop[key]
+        if role in ("combobox", "radiogroup") and option_names(prop.get("options")):
+            entry["options"] = option_names(prop.get("options"))
+        if role == "link" and isinstance(prop.get("href"), str):
+            entry["href"] = prop["href"]
+        if "visible" in prop and prop["visible"] is not True:
+            entry["visible_when"] = prop["visible"]
+        if scope == "repeated":
+            entry["repeated"] = True
+        contract.append(entry)
+    return contract
+
+
+def role_assertions(role: str, name: str, prop: dict) -> list[str]:
+    """Render deterministic role/name assertions for one visible functional element."""
+    label = json.dumps(name, ensure_ascii=False)
+    if role == "password":
+        return [f"  {{ const field = page.getByLabel({label}, {{ exact: true }});",
+            "    await expect(field).toHaveCount(1);",
+            '    await expect(field).toHaveAttribute("type", "password"); }']
+    locator = f"page.getByRole({json.dumps(role)}, {{ name: {label}, exact: true }})"
+    if role in ("combobox", "radiogroup"):
+        child = "option" if role == "combobox" else "radio"
+        lines = [f"  {{ const control = {locator};", "    await expect(control).toHaveCount(1);"]
+        for option in option_names(prop.get("options")):
+            lines.append(f"    await expect(control.getByRole({json.dumps(child)}, {{ name: {json.dumps(option, ensure_ascii=False)}, exact: true }})).toHaveCount(1);")
+        lines[-1] += " }"
+        return lines
+    if role == "link" and static_href(prop):
+        return [f"  {{ const link = {locator};", "    await expect(link).toHaveCount(1);",
+            f'    await expect(link).toHaveAttribute("href", {json.dumps(static_href(prop), ensure_ascii=False)}); }}']
+    return [f"  await expect({locator}).toHaveCount(1);"]
+
+
+def absence_assertion(role: str, name: str) -> str:
+    """Render the assertion that a hidden functional element is absent from the accessibility tree."""
+    label = json.dumps(name, ensure_ascii=False)
+    if role == "password":
+        return f"  await expect(page.getByLabel({label}, {{ exact: true }})).toHaveCount(0);"
+    return f"  await expect(page.getByRole({json.dumps(role)}, {{ name: {label}, exact: true }})).toHaveCount(0);"
+
+
+# Playwright exposes password inputs with the textbox role, so these roles share one name space.
+TEXT_ROLES = {"textbox", "password"}
+
+
+def role_key(role: str) -> str:
+    """Group roles whose locators can match the same element (password fields are textboxes)."""
+    return "textbox" if role in TEXT_ROLES else role
+
+
+def semantic_assertions(design: dict, elements: dict, root: str, state: dict) -> list[str]:
+    """Render role, name, type, option, href and alert checks for one display state."""
+    shown, hidden, excluded, alerts = {}, [], set(), {"shown": 0, "hidden": 0}
+    for uid, node in elements.items():
+        if uid == root or not isinstance(node, dict):
+            continue
+        role, name = accessible_role(node), accessible_name(node)
+        if semantic_scope(design, uid):
+            # Repeated rows and decoration may legitimately reuse a name; never assert its absence.
+            if role is not None and name is not None:
+                excluded.add((role_key(role), name))
+            continue
+        is_shown = visible(design, uid, state)
+        if node.get("type") == "alert":
+            alerts["shown" if is_shown else "hidden"] += 1
+            continue
+        if role is None or name is None:
+            continue
+        prop = node.get("prop") if isinstance(node.get("prop"), dict) else {}
+        if is_shown:
+            shown.setdefault((role, name), []).append(prop)
+        elif (role, name) not in hidden:
+            hidden.append((role, name))
+    lines = []
+    for (role, name), props in shown.items():
+        # Several shown elements with one role/name contradict the unique-name rule; a count(1)
+        # check would be unsatisfiable for the declared design, so leave them to testid checks.
+        if len(props) == 1:
+            lines.extend(role_assertions(role, name, props[0]))
+    blocked = {(role_key(role), name) for role, name in shown} | excluded
+    shown_names = {name for _, name in shown}
+    for role, name in hidden:
+        # A label locator also matches other controls with that name; a shared role/name is covered above.
+        if (role_key(role), name) in blocked or (role == "password" and name in shown_names):
+            continue
+        lines.append(absence_assertion(role, name))
+    if alerts["shown"] == 1:
+        lines.append('  await expect(page.getByRole("alert")).toBeVisible();')
+    elif alerts["shown"] > 1:
+        lines.append('  await expect(page.getByRole("alert").first()).toBeVisible();')
+    elif alerts["hidden"]:
+        lines.append('  await expect(page.getByRole("alert")).toHaveCount(0);')
+    return lines
 
 
 def existence_suite(design: dict, pid: str) -> str:
@@ -69,7 +202,7 @@ def existence_suite(design: dict, pid: str) -> str:
         if possible and candidate not in states:
             states.append(candidate)
 
-    lines = ['// Compiler-owned presence tests. Display values belong to this suite only.',
+    lines = [SUITE_HEADER,
         'import { test, expect } from "@playwright/test";', '']
     for number, state in enumerate(states, 1):
         lines.append(f'test({json.dumps(pid + " / display " + str(number) + " / UI element existence")}, async ({{ page }}) => {{')
@@ -89,6 +222,8 @@ def existence_suite(design: dict, pid: str) -> str:
             locator = f"page.getByTestId({json.dumps(uid)})"
             shown = visible(design, uid, state)
             lines.append(f"  await expect({locator}){'' if shown else '.not'}.toBeVisible();")
+        # Role/name checks mirror how acceptance tests locate controls (strict, exact names).
+        lines.extend(semantic_assertions(design, elements, page["root"], state))
         lines.extend([
             '  await expect.poll(() => page.evaluate(({ pageId, keys }) => {',
             '    const state = (window as unknown as { __ARC_UI_DATA__?: { page: string; data: Record<string, unknown> } }).__ARC_UI_DATA__;',
@@ -105,7 +240,12 @@ def existence_suite(design: dict, pid: str) -> str:
 
 
 def require_green(result: dict) -> None:
-    """Require passing actual browser assertions with no reported runtime errors."""
+    """Require passing actual browser assertions with no reported runtime errors.
+
+    An unverified result (no launchable browser) is not a failure the application can fix;
+    gates accept it and rely on their other checks. It is never reported as GREEN."""
+    if is_unverified(result):
+        return
     if result["returncode"] or result.get("errors") or not result.get("passed") or result.get("failed"):
         raise CheckFailure("UI checks are not GREEN", result)
 
@@ -175,11 +315,51 @@ class FrontendChecks:
             raise ValueError(f"Frontend check timed out after {timeout or self.timeout}s") from error
 
     def install_browser(self) -> None:
-        """Install the Chromium browser used by the generated Playwright tests."""
-        result = self.execute(["node_modules/@playwright/test/cli.js", "install", "chromium"], timeout=600)
-        print(result["output"], flush=True)
-        if result["returncode"]:
-            raise ValueError("Playwright Chromium installation failed; install its OS libraries if reported above")
+        """Install Chromium and prove it launches; never fatal (see stages/frontend/browser.py).
+
+        On Linux a failed launch is retried after `install --with-deps`, which installs the
+        OS libraries when the runner has root (typical for containers). Probed once per process."""
+        if browser_state()["available"] is not None:
+            return
+        if os.getenv("ARC_DISABLE_BROWSER", "").strip() == "1":
+            # Exercise the degraded (no browser) path deliberately, e.g. to test it locally.
+            set_browser_state(False, "ARC_DISABLE_BROWSER=1")
+            print("WARNING: browser checks disabled by ARC_DISABLE_BROWSER=1.", flush=True)
+            return
+        cli = "node_modules/@playwright/test/cli.js"
+        try:
+            installed = self.execute([cli, "install", "chromium"], timeout=600)
+            print(installed["output"][-4000:], flush=True)
+        except ValueError as error:
+            print(f"Playwright Chromium installation did not finish: {error}", flush=True)
+        probe = self.probe_browser()
+        if probe["returncode"] and sys.platform.startswith("linux"):
+            print("Chromium cannot launch; installing its OS libraries (playwright install --with-deps chromium).",
+                flush=True)
+            try:
+                deps = self.execute([cli, "install", "--with-deps", "chromium"], timeout=900)
+                print(deps["output"][-4000:], flush=True)
+            except ValueError as error:
+                print(f"Installing Chromium OS libraries did not finish: {error}", flush=True)
+            probe = self.probe_browser()
+        if probe["returncode"]:
+            set_browser_state(False, probe["output"])
+            print("WARNING: Playwright Chromium cannot launch here. Continuing without browser checks: "
+                "UI and trigger tasks are gated by TypeScript, backend tests and the build.\n"
+                + probe["output"][-2000:], flush=True)
+        else:
+            set_browser_state(True)
+            print("Playwright Chromium launch check: OK", flush=True)
+
+    def probe_browser(self) -> dict:
+        """Launch and close headless Chromium once with the workspace's Playwright."""
+        script = ("const { chromium } = require('@playwright/test');"
+            "chromium.launch().then(b => b.close()).then(() => console.log('chromium ok'))"
+            ".catch(e => { console.error(String(e && e.message || e)); process.exit(1); });")
+        try:
+            return self.execute(["-e", script], timeout=120)
+        except ValueError as error:
+            return {"returncode": 1, "output": str(error)}
 
     def typecheck(self, files: list[str], *, test_roots=("frontend/tests/ui",), source_files=("src/**/*.ts", "src/**/*.tsx")) -> dict:
         """Compile selected frontend/test roots with a temporary TypeScript configuration, then remove that configuration."""
@@ -203,6 +383,8 @@ class FrontendChecks:
         """Run selected UI-existence specs with Playwright and normalize the reporter output."""
         if not files:
             raise ValueError("Do not run an empty UI suite")
+        if not browser_available():
+            return unverified_result(files)
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]

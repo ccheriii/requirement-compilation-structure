@@ -10,7 +10,8 @@ Read a whole file:
 {"tool_calls":[{"tool":"read_file","path":"backend/src/db/initialize.ts"}]}.
 Read an inclusive 1-based line range:
 {"tool_calls":[{"tool":"read_file","path":"backend/src/db/initialize.ts","start_line":1,"end_line":40}]}.
-Omit end_line to read through EOF. Read contents appear in input.read_files[path] as
+Omit end_line to read through EOF (at most 600 lines per read; a truncated excerpt has
+truncated=true and a notice naming the next start_line). Read contents appear in input.read_files[path] as
 excerpts with path, content, start_line, end_line, total_lines and writable.
 context_result.read_paths lists the files just read; use retained excerpts for their content.
 

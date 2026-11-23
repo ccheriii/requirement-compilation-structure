@@ -98,10 +98,27 @@ def _http_response(response: httpx.Response) -> None:
         request_id=response.headers.get("x-request-id"), body=response.text)
 
 
+DEFAULT_REQUEST_TIMEOUT = 300.0
+
+
+def request_timeout() -> float:
+    """Seconds one model request may wait for a response (MODEL_TIMEOUT, default 300).
+
+    Requests are not streamed, so a stalled provider connection only ends at this timeout;
+    the model clients retry timeouts themselves, without SDK-level retries on top.
+    """
+    import os
+    try:
+        value = float(os.getenv("MODEL_TIMEOUT") or DEFAULT_REQUEST_TIMEOUT)
+    except ValueError:
+        value = DEFAULT_REQUEST_TIMEOUT
+    return value if value > 0 else DEFAULT_REQUEST_TIMEOUT
+
+
 def http_client() -> httpx.Client:
     """Connect directly, retaining audit hooks and the SDK's transport limits."""
     from openai import DefaultHttpxClient
-    return DefaultHttpxClient(trust_env=False, timeout=httpx.Timeout(600),
+    return DefaultHttpxClient(trust_env=False, timeout=request_timeout(),
         event_hooks={"request": [_http_request], "response": [_http_response]})
 
 

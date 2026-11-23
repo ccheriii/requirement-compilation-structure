@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -29,6 +30,12 @@ function inspect(filename, marker = false) {
       const columns = db.prepare(`PRAGMA table_info(${quote(table)})`).all().map(row => row.name);
       if (!columns.length) throw new Error("Missing table: " + table);
       for (const field of fields) if (!columns.includes(field)) throw new Error("Missing column: " + table + "." + field);
+    }
+    // A fresh database must contain the rows its seeds/TABLE.sql inserts; a statement whose
+    // SELECT/WHERE matches nothing silently seeds no Given record.
+    if (!marker) for (const table of plan.seeded_tables ?? []) {
+      if (!db.prepare(`SELECT COUNT(*) AS count FROM ${quote(table)}`).get().count)
+        throw new Error(`Seed inserted no rows: seeds/${table}.sql contains INSERT statements but ${table} is empty after fresh initialization`);
     }
     if (db.prepare("PRAGMA foreign_key_check").all().length) throw new Error("Foreign-key validation failed");
     if (marker && db.prepare('SELECT value FROM "__arc_startup_probe"').get()?.value !== "preserve")
@@ -128,6 +135,21 @@ class DatabaseChecks:
         if not self.node:
             raise ValueError("Node.js is required for database initialization checks")
 
+    def seeded_tables(self):
+        """Tables whose seeds/TABLE.sql contains an INSERT outside comments."""
+        tables = []
+        for name in self.schema["entities"]:
+            path = self.output / f"backend/src/db/seeds/{name}.sql"
+            if not path.is_file():
+                continue
+            # Scan comments and string literals left to right so neither hides the other.
+            text = re.sub(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'",
+                lambda match: "''" if match.group(0).startswith("'") else " ",
+                path.read_text(encoding="utf-8-sig"), flags=re.DOTALL)
+            if re.search(r"\bINSERT\b", text, re.IGNORECASE):
+                tables.append(name)
+        return tables
+
     def run(self):
         try:
             build = capture_process([*npm_command(), "run", "build", "--workspace", "@arc/backend"],
@@ -135,8 +157,17 @@ class DatabaseChecks:
             if build["returncode"]:
                 return {**build, "phase": "backend build"}
             with TemporaryDirectory(prefix="arc-db-check-") as temporary:
-                plan = {"directory": temporary, "database": str(self.output / "backend/data/app.db"),
+                database = self.output / "backend/data/app.db"
+                # The output database is regenerated from the current seeds; an older file would
+                # keep stale startup rows because WHERE NOT EXISTS skips existing keys.
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    try:
+                        Path(str(database) + suffix).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                plan = {"directory": temporary, "database": str(database),
                     "tables": {name: list(entity["fields"]) for name, entity in self.schema["entities"].items()},
+                    "seeded_tables": self.seeded_tables(),
                     "setup": [*npm_command(), "run", "db:init", "--workspace", "@arc/backend"]}
                 runner = Path(temporary) / "check-database.mjs"
                 arguments = Path(temporary) / "plan.json"

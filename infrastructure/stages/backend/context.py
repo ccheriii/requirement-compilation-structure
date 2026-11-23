@@ -17,15 +17,40 @@ def load_context(arc_dir: Path):
     return tree, schema, obligations
 
 
+from infrastructure.stages.requirements.contracts import requirement_contracts
+
+
 def requirement_context(tree, rid: str) -> dict:
     """Return one requirement with its own structured steps and their concatenated teaching/model context."""
-    return {**tree.requirements[rid], "steps": [tree.steps[sid] for sid in tree.own_steps[rid]]}
+    context = {**tree.requirements[rid], "steps": [tree.steps[sid] for sid in tree.own_steps[rid]]}
+    contracts = requirement_contracts(tree, rid)
+    if contracts:
+        context["role_contracts"] = contracts
+    return context
 
 
 def api_requirement_uses(tree, allocations: dict, aid: str) -> list[dict]:
     """Supply every API owner once, with structured steps as the sole scenario representation."""
     return [{**tree.requirements[rid], "steps": [tree.steps[sid] for sid in tree.own_steps[rid]]}
         for rid, ids in allocations.items() if aid in ids]
+
+
+RUNTIME_FILES = ("backend/src/app.ts", "backend/src/server.ts", "backend/src/api/register.ts",
+    "backend/src/db/initialize.ts", "backend/src/db/seed.ts", "backend/src/db/password.ts", "backend/src/clock.ts")
+
+
+def startup_references(output: Path) -> list[str]:
+    """Existing backend wiring and startup-data files (DB init, seed loader, every seeds/*.sql).
+
+    Logs showed agents spending many model rounds re-reading exactly these small files;
+    pinning them up front lets the first round act instead of read.
+    """
+    output = Path(output)
+    paths = [relative for relative in RUNTIME_FILES if (output / relative).is_file()]
+    seeds = output / "backend/src/db/seeds"
+    if seeds.is_dir():
+        paths.extend(f"backend/src/db/seeds/{path.name}" for path in sorted(seeds.glob("*.sql")))
+    return paths
 
 
 def supplied_sources(output: Path, api: dict, schema: dict) -> dict:
@@ -42,6 +67,12 @@ def supplied_sources(output: Path, api: dict, schema: dict) -> dict:
                     pending.append(target)
     paths = ["backend/src/api/types.ts", "backend/src/db/client.ts", "backend/tests/support/context.ts"]
     paths.extend(f"backend/src/db/tables/{name}.sql" for name in sorted(entities))
+    # Shared password encoding, the seed loader and the startup rows of related entities:
+    # tests reuse seeded Given records and handlers verify their seeded credentials.
+    optional = ["backend/src/db/password.ts", "backend/src/db/seed.ts", "backend/src/db/initialize.ts",
+        "backend/src/app.ts", "backend/src/server.ts", "backend/src/clock.ts"]
+    optional.extend(f"backend/src/db/seeds/{name}.sql" for name in sorted(entities))
+    paths.extend(relative for relative in optional if (output / relative).is_file())
     return {relative: (output / relative).read_text(encoding="utf-8-sig") for relative in paths}
 
 

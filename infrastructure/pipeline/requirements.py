@@ -1,5 +1,7 @@
 """Step 01: read the requirement tree, display every field, and analyze images."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
 import re
 from pathlib import Path
@@ -35,6 +37,11 @@ def preorder_nodes(root: dict):
 def terminal_link(label: str, target: Path) -> str:
     """Render an OSC 8 hyperlink understood by modern terminal emulators."""
     return f"{OSC8_OPEN}{target.resolve().as_uri()}{ESC}{label}{OSC8_CLOSE}"
+
+
+def failed_analysis(error: str) -> dict:
+    """Empty visual evidence recorded when one reference could not be analyzed."""
+    return {"layout": "", "elements": [], "style": "", "error": error}
 
 
 class RequirementExplorer:
@@ -290,15 +297,43 @@ def explore_requirement(input_dir: Path, arc_dir: Path, pause: bool = False) -> 
     checkpoint(arc_dir.parent, stage="01", task="requirements", action="Publish input requirement snapshot",
         details={"source": str(source), "image_references": references})
     analysis = {}
+    # Visual evidence is optional: publish an empty analysis first so later stages
+    # never fail on a missing artifact when the visual model is unavailable.
+    save_json(arc_dir / "visual_analysis.json", analysis)
     if references:
-        model = VisualModel()
+        model, model_error = None, None
+        try:
+            model = VisualModel()
+        except Exception as error:  # misconfigured visual model must not block later stages
+            model_error = f"{type(error).__name__}: {error}"
+            console.show("3. Visual analysis | FAILED; continuing without visual evidence", model_error)
+        def analyze(reference):
+            try:
+                return model.analyze(input_dir / reference), None
+            except Exception as error:  # visual evidence is optional; never block later stages
+                return failed_analysis(f"{type(error).__name__}: {error}"), error
+
+        # Images are independent: request them concurrently (each in a copy of the
+        # logging context), then publish results sequentially in reference order.
+        results = {}
+        if model is not None:
+            print("Analyzing images concurrently: " + ", ".join(references), flush=True)
+            with ThreadPoolExecutor(max_workers=min(8, len(references))) as pool:
+                futures = {reference: pool.submit(copy_context().run, analyze, reference) for reference in references}
+                results = {reference: future.result() for reference, future in futures.items()}
         for reference in references:
-            print(f"Analyzing image: {reference}", flush=True)
-            analysis[reference] = model.analyze(input_dir / reference)
+            if model is None:
+                analysis[reference] = failed_analysis(model_error)
+            else:
+                analysis[reference], error = results[reference]
+                if error is not None:
+                    console.show(f"3. Visual analysis | {reference} | FAILED; continuing", str(error))
             save_json(arc_dir / "visual_analysis.json", analysis)
             checkpoint(arc_dir.parent, stage="01", task=reference, action="Publish visual reference analysis",
+                status="FAILED" if "error" in analysis[reference] else "GREEN",
                 details={"reference": reference, "analysis": analysis[reference]})
-            console.show(f"3. Visual analysis | {reference}", json.dumps(analysis[reference], ensure_ascii=False, indent=2))
+            if "error" not in analysis[reference]:
+                console.show(f"3. Visual analysis | {reference}", json.dumps(analysis[reference], ensure_ascii=False, indent=2))
     else:
         console.show("3. Visual analysis", "No referenced images; no model call is needed.")
     save_json(arc_dir / "visual_analysis.json", analysis)

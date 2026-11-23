@@ -135,6 +135,9 @@ class FileTools:
                 self.files.add(self._target_path)
                 self.writable.add(self._target_path)
             self.changed_paths.update(self._pending)
+            # Keep edited files pinned: their excerpts are dropped after an edit, and
+            # re-reading them costs a whole model round.
+            self.files.update(self._pending)
             return results
         except Exception:
             for path in reversed(written):

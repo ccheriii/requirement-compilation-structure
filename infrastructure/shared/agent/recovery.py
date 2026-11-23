@@ -1,6 +1,7 @@
 """Isolate failed implementation tasks and complete independent final checks."""
 
 from contextlib import contextmanager
+import errno
 import re
 from uuid import uuid4
 
@@ -24,13 +25,21 @@ def _snapshot(output):
 def implementation_task(output, entry, console, label):
     """Archive rejected files, restore the task baseline, and continue on acceptance failure.
 
-    Missing prerequisites are checked before this boundary. Disk errors, interrupts,
-    and unexpected compiler exceptions propagate; they are not business failures.
+    Missing prerequisites are checked before this boundary. Local OS errors such as a
+    file locked by another process fail only this task (baseline restored). A full disk,
+    interrupts and unexpected compiler exceptions propagate; they are not business failures.
     """
     before = _snapshot(output)
     try:
         yield
-    except ValueError as error:
+    except (ValueError, OSError) as error:
+        if isinstance(error, OSError) and getattr(error, "errno", None) == errno.ENOSPC:
+            try:  # recording can fail on a full disk too; the original error is what matters
+                checkpoint(output, task=label, action="Record interrupted implementation task", status="FAILED",
+                    details={"error": str(error), "error_type": type(error).__name__})
+            except Exception:
+                pass
+            raise
         after = _snapshot(output)
         changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
         name = re.sub(r"[^\w.-]+", "_", label).strip("._")[:100] or "task"
@@ -39,7 +48,7 @@ def implementation_task(output, entry, console, label):
             if path in after:
                 save_bytes(directory / "files" / path, after[path])
         failure = {"status": "FAILED", "task": label, "phase": entry.get("status"),
-            "error": str(error), "turns": getattr(error, "turns", 0),
+            "error": str(error), "error_type": type(error).__name__, "turns": getattr(error, "turns", 0),
             "feedback": getattr(error, "feedback", None), "changed_files": sorted(changed),
             "deleted_files": sorted(changed - after.keys()),
             "archive": directory.relative_to(output).as_posix()}
@@ -75,7 +84,7 @@ def final_checks(console, **checks):
             if accept:
                 accept(result)
             results[name] = {"status": "GREEN", "result": result}
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, RuntimeError, OSError) as error:
             results[name] = {"status": "FAILED", "result": result, "error": str(error)}
         console.show("Final verification | " + name + " | " + results[name]["status"],
             results[name].get("error") or (result or {}).get("output", "Passed"))

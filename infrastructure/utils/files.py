@@ -3,6 +3,10 @@
 import json
 from pathlib import Path
 import re
+import time
+
+# Windows sync clients, antivirus scanners and dev servers briefly lock files.
+REPLACE_ATTEMPTS = 6
 
 
 def normalize_newlines(content: str) -> str:
@@ -23,7 +27,14 @@ def save_bytes(path: Path, content: bytes) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     try:
         temporary.write_bytes(content)
-        temporary.replace(path)
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.2 * 2 ** attempt)
     finally:
         temporary.unlink(missing_ok=True)
 

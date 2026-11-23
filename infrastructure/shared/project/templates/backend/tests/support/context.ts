@@ -1,7 +1,7 @@
 import type { TestContext } from "node:test";
-import { scryptSync } from "node:crypto";
 import { createDatabaseClient } from "../../src/db/client.js";
 import { initializeDatabase } from "../../src/db/initialize.js";
+import { hashPasswordWithSalt } from "../../src/db/password.js";
 import { basename, dirname } from "node:path";
 
 // All tests in a run share the real backend; test files and cases execute sequentially.
@@ -28,10 +28,9 @@ export function createApiTest(context: TestContext) {
 }
 
 // Fixture encoding policy for credential APIs. Fixture setup is not API behavior.
-// Production may use a stronger compatible format; these existing records must
-// remain verifiable. No test relies on an exact random hash or generated UUID.
+// Same scrypt$saltHex$digestHex format and parameters as backend/src/db/password.ts
+// (hashPassword/verifyPassword) and seed_password_hash, with a fixed salt so fixture
+// rows are deterministic. No test relies on an exact random hash or generated UUID.
 export function fixturePasswordHash(password: string): string {
-  const salt = "00112233445566778899aabbccddeeff";
-  const digest = scryptSync(password, Buffer.from(salt, "hex"), 64).toString("hex");
-  return `scrypt$${salt}$${digest}`;
+  return hashPasswordWithSalt(password, "00112233445566778899aabbccddeeff");
 }

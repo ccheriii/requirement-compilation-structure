@@ -8,15 +8,19 @@ import json
 
 from infrastructure.shared.agent.files import editable_application_path
 from infrastructure.shared.agent.loop import run_file_agent
+from infrastructure.shared.agent.parallel import parallel_agents, run_parallel
 from infrastructure.shared.agent.recovery import implementation_task, final_checks, complete_report
 from infrastructure.shared.agent.context import SourceFiles
 from infrastructure.shared.agent.discovery import project_index
 from infrastructure.shared.project.entrypoints import selected_path
-from infrastructure.stages.frontend.triggers.e2e_runtime import CONFIG, FIXTURE, prepare_e2e
+from infrastructure.stages.frontend.browser import is_unverified
+from infrastructure.stages.frontend.triggers.e2e_runtime import CONFIG, FIXTURE, VITE_CONFIG, prepare_e2e
+from infrastructure.stages.frontend.triggers.supplied import normalize_supplied, protect_workspace, requirement_specs
 from infrastructure.stages.frontend.triggers.testing import E2EChecks, test_path
 from infrastructure.stages.frontend.ui.runtime import APPLICATION_ENTRYPOINTS, prepare_frontend
 from infrastructure.stages.frontend.ui.testing import FrontendChecks, require_green, test_path as ui_test_path
-from infrastructure.stages.backend.context import related_schema
+from infrastructure.stages.backend.context import related_schema, startup_references
+from infrastructure.stages.requirements.contracts import CONTRACT_RULES
 from infrastructure.stages.backend.testing import BackendChecks, require_green as require_backend_green
 from infrastructure.stages.frontend.triggers.design import api_ids, trigger_obligations
 from infrastructure.stages.frontend.triggers.scope import TriggerCheckFailure, model_context
@@ -51,7 +55,11 @@ def editable_runtime_path(output, path):
 
 
 def test_run_status(result):
-    """Pass every real failure to repair; do not guess its cause from error text."""
+    """Pass every real failure to repair; do not guess its cause from error text.
+
+    UNVERIFIED means no browser could run the suite: never GREEN, so implementation still runs."""
+    if is_unverified(result):
+        return "UNVERIFIED"
     try:
         require_green(result)
         if result.get("skipped") or result.get("flaky"):
@@ -60,6 +68,29 @@ def test_run_status(result):
     except ValueError:
         return "REPAIR_REQUIRED"
 
+
+LOCATOR_POLICY = """Black-box locator policy (external graders locate controls exactly this way):
+- Locate requirement-named controls from the page root with
+  page.getByRole(role, { name, exact: true }) for link, button, textbox, combobox, checkbox,
+  radio, radiogroup, heading and alert. Names come verbatim from the requirement text.
+- Password fields have no textbox role: use page.getByLabel(name, { exact: true }) and, when
+  concealment matters, assert toHaveAttribute("type", "password").
+- Locate displayed dynamic values (for example the current user's name or a created record's
+  title) with page.getByText(value, { exact: true }).
+- Never use getByTestId, data-testid, CSS id/class selectors, XPath, nth(), first() or last()
+  to find or disambiguate a requirement-named control, and do not narrow it to a container.
+  Strict mode is intended: two elements matching one such locator is an application defect.
+- Fill date fields as textboxes with ISO values: getByRole("textbox", { name }).fill("YYYY-MM-DD").
+- A field offering a small fixed set of exclusive options is a radiogroup:
+  getByRole("radiogroup", { name: FIELD }).getByRole("radio", { name: OPTION, exact: true }).check().
+  A longer option list or a field with a default is a combobox:
+  getByRole("combobox", { name, exact: true }).selectOption({ label }).
+- Assert error and rejection messages through getByRole("alert").
+- Navigate by clicking the link, then assert expect(page).toHaveURL(/\\/path\\/?$/) for the
+  requirement's route (/\\/$/ for the root page).
+- Generate new identities from randomUUID-derived values. When the requirement states no
+  format or length rule for a field, use values containing hyphens and digits and at least 25
+  characters, so invented restrictions are detected; when it states one, satisfy that rule."""
 
 TEST_INSTRUCTIONS = """Write a small Playwright functional smoke suite for the CURRENT requirement.
 The goal is to verify that real UI input reaches the backend API and its result is
@@ -95,24 +126,29 @@ before the browser actions. Seed only additional necessary Given rows
 with parameterized SQL and valid values; bind booleans as 0/1. Do not use another API to
 manufacture Given state.
 
-Drive actions through the browser, without mocks or injected UI state. Prefer supplied
-UI IDs for stable selectors. Assert the visible business result with retrying Playwright
+Drive actions through the browser, without mocks or injected UI state. Follow the
+black-box locator policy below for every control the requirement names; test ids or scoped
+locators are acceptable only for controls the requirement does not name. Assert the visible business result with retrying Playwright
 assertions, then check a small persisted business outcome only when necessary. Do not
 assert every DB field, full-table snapshots, exact cookie/hash encodings, generated IDs,
 timestamps, decorative text, styling or intermediate loading states. If deletion versus
 soft invalidation is not specified, assert the observable session behavior instead of
 choosing one database strategy. Do not invent wording or storage policies.
 Use original requirement-defined UI names and roles exactly when they are explicit; do not
-replace them with aliases learned from current application code. Conversely, do not invent
-exact captions, placeholders or globally unique link names when the requirement does not
-specify them. Scope navigation and business-object locators by their semantic purpose.
+replace them with aliases learned from current application code. Locate requirement-named
+controls from the page root; do not narrow them with a container, nth(), first() or a test id.
+A strict-mode violation means two elements share that accessible name: the application must
+fix it, not the test. Do not invent exact captions for controls the requirement leaves unnamed.
+When task.locator_style_reference lists supplied grader helpers, follow their conventions;
+supplied specs and helpers are read-only references and must not be imported by smoke suites.
 
 Tests still need real assertions and must not be skipped or weakened to pass. During
 test generation, fix test syntax, fixtures or invalid selectors. Missing application
 behavior is valid RED; retain that case for implementation. Runtime failures in supplied
 application sources are implementation feedback, not a reason to rewrite the expected
 business result. Compilation and a real browser run check the suite before code repair.
-"""
+
+""" + LOCATOR_POLICY + "\n"
 
 IMPLEMENT_INSTRUCTIONS = """Implement the current requirement's interactions in the actual application.
 Step 09's triggers are a reference prototype: preserve their requirement-defined behavior,
@@ -138,6 +174,35 @@ the required name. Original explicit requirements take precedence over generated
 reference examples and existing incorrect code. Fix a naming violation in the application,
 not by weakening an otherwise correct test. Unspecified wording remains your choice;
 dynamic business names and user input must still reflect real data.
+
+Accessible-role contract (black-box tests locate controls by role and accessible name):
+- A field offering a small fixed set of exclusive options renders as a radiogroup
+  (fieldset with legend, or role="radiogroup" named by the field label) of native
+  <input type="radio"> controls, each with its own label. A long option list or a field
+  with a default value renders as a native <select> labelled by the field name.
+- Password fields are <input type="password"> with an associated <label>.
+- Date fields are <input type="text"> accepting ISO strings, with placeholder "YYYY-MM-DD"
+  unless the requirement names another placeholder; a native type="date" input has no
+  textbox role.
+- Every error or rejection message renders in an element with role="alert".
+- A dynamic value such as the signed-in user's name renders alone in its own element,
+  exactly once on the page.
+- Accessible names are unique per role on a page (two links, two buttons or two fields never
+  share a name): decorative reference-image content never repeats the name of a functional
+  link, button or field (render it as plain text, rename it or omit it). Labels and captions contain only their required text; markers and icons go in
+  aria-hidden siblings, never in CSS generated content or inside the label.
+- Navigation targets are <a href="..."> links. Checkboxes and radios stay native, visible
+  and clickable (never display:none, zero-size or covered by another element).
+
+Navigate to the exact route the requirement names: pathname only, with no added query
+string, hash or redirect/next parameter, and no HashRouter. Pages render at their literal
+path on direct load and reload. After a mutation that changes the session or identity
+(sign-in, registration, sign-out, profile change), refresh the shared session state or do a
+full navigation so the destination shows the new state without a manual reload. Never cache
+identity or session data in localStorage or sessionStorage; derive it from the server. Do
+not add validation the requirement does not state (maxLength, minLength, pattern, character
+classes, limits copied from reference hint text); when the requirement states no format,
+free-text identity fields accept any non-empty value including hyphens, digits and mixed case.
 
 Before adding an event or effect, read the existing component and follow its current
 UI -> callback/effect -> service -> HTTP call chain. Extend or reuse the existing owner
@@ -190,7 +255,11 @@ writable according to tools; original designs and shared test tools remain refer
 When startup evidence points into existing database runtime/SQL, repair those files too.
 Preserve the declared schema, constraints, previous tables and requirement-defined seed
 data; correct their executable implementation rather than removing required guarantees.
-Correct a generated test only with original requirement evidence, preserving valid coverage.
+Generated smoke tests may be corrected only for fixture, seed or syntax errors; never change
+their locators or roles to match the current UI. Supplied acceptance specs
+(frontend/tests/e2e/supplied) and independent acceptance suites are never editable. When
+task.supplied_acceptance_specs is present, those read-only specs are the authoritative grader
+contract for this requirement: match their roles, accessible names, routes and flows.
 The gate compiles and runs current/accepted browser scenarios, affected backend HTTP suites,
 UI presence regression and final builds. Return ordinary edit_file calls; no path metadata
 or placeholder files for reference trigger IDs are required.
@@ -205,13 +274,19 @@ If a necessary correction is outside tool scope, explain the exact blocker in di
 
 
 def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts,
-        model, console, report, max_turns=10, max_tests=2):
+        model, console, report, max_turns=10, max_tests=2, supplied=None):
     """Implement design one requirement at a time through real-app E2E TDD.
 
     Prepare dependencies/runtime, generate initial key scenario tests, then
     integrate and repair the current requirement before advancing. Regress
-    accepted smoke scenarios, build the app, and update the caller's report."""
+    accepted smoke scenarios, build the app, and update the caller's report.
+
+    ``supplied`` is the install_supplied_specs() result. Supplied specs are read-only
+    references for the implementer; they are not per-requirement gates because they
+    may depend on requirements implemented later."""
     output = arc_dir.parent.resolve()
+    supplied = normalize_supplied(supplied)
+    supplied_helpers = list(supplied["helpers"])
     prepare_frontend(output)
     prepare_e2e(output, backend)
     console.show("E2E preparation | Dependencies", "Install workspace dependencies and Chromium. Each browser run owns a new real test database; production data is not used.")
@@ -255,6 +330,7 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                 references=["frontend/src/ui-runtime.ts", "frontend/package.json",
                     "frontend/tsconfig.json", "frontend/playwright.ui.config.ts"])
             workspace.allow_write = lambda path: editable_runtime_path(output, path)
+            protect_workspace(workspace)
 
             def baseline_feedback(value):
                 return selection.feedback(workspace, backend_selection.feedback(workspace, value))
@@ -274,27 +350,109 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
             report["baseline"]["repair_turns"] = repair["turns"]
         report["baseline"].update(status="GREEN", checks=baseline)
     save_json(arc_dir / "frontend_e2e.json", report)
-    for number, rid in enumerate(tree.leaves, 1):
+
+    def scenario_inputs(rid, source_selection):
+        """Scenario context plus the smoke-test generation task/workspace for one requirement."""
         tids = set(design["requirements"][rid])
-        steps = tree.own_steps[rid]
-        label = f"E2E requirement {number}/{len(tree.leaves)} {rid}"
         context = scenario_context(ui, design, rid)
         pages = context["page_subtrees"]
         if not pages and not tids:
-            report["requirements"][rid] = {"status": "NO_TRIGGERS", "triggers": []}
-            save_json(arc_dir / "frontend_e2e.json", report)
-            continue
-        targets = tids
+            return None
+        rid_specs = requirement_specs(supplied, rid)
         relative = test_path(rid, output)
-        ui_files = [ui_test_path(pid) for pid in pages if (output / ui_test_path(pid)).is_file()]
         called = {aid for trigger in context["triggers"].values() for aid in api_ids(trigger)}
         context["obligations"] = {tid: trigger_obligations(trigger, backend) for tid, trigger in context["triggers"].items()}
         context.update({"requirement": contexts[rid],
-            "target_trigger_ids": sorted(targets),
+            "target_trigger_ids": sorted(tids),
             "backend_apis": {aid: backend["apis"][aid] for aid in sorted(called)}})
+        test_context = {**model_context(context), "schema": related_schema(schema, context["backend_apis"].values()), "test_path": relative if (output / relative).is_file() else None,
+            "max_tests": max_tests}
+        if supplied_helpers or rid_specs:
+            test_context["locator_style_reference"] = {"files": [*supplied_helpers, *rid_specs],
+                "note": "Read-only grader-style helpers/specs. Copy their locator conventions and "
+                    "requirement names; do not import them into the smoke suite."}
+        test_workspace = source_selection.workspace(target=("e2e_test", rid), existing=relative,
+            references=["frontend/src/ui-runtime.ts", CONFIG, FIXTURE, "backend/tests/support/context.ts",
+                VITE_CONFIG, *startup_references(output),
+                *source_selection.paths("page", pages), *APPLICATION_ENTRYPOINTS,
+                "frontend/package.json", "frontend/tsconfig.json",
+                *backend_selection.paths("api", called),
+                *[f"backend/src/db/tables/{name}.sql" for name in related_schema(schema, context["backend_apis"].values())],
+                *supplied_helpers, *rid_specs])
+        protect_workspace(test_workspace)
+        return {"tids": tids, "context": context, "pages": pages, "rid_specs": rid_specs,
+            "relative": relative, "called": called, "test_context": test_context,
+            "test_workspace": test_workspace}
+
+    def pregenerate(rid):
+        """Write one requirement's smoke suite ahead of the sequential loop.
+
+        Suites are written from the requirement, design and UI contracts, not from later
+        implementation, and test generation never gated on behavior (only compilation), so
+        the loop treats a pre-written suite exactly like one resumed from an earlier run:
+        it runs it, and regenerates it only if it no longer compiles. Each worker has its
+        own source catalogue and may write only its own spec file."""
+        relative = test_path(rid, output)
+        if (output / relative).is_file():
+            return None
+        source_selection = SourceFiles(output, ui)
+        inputs = scenario_inputs(rid, source_selection)
+        if inputs is None:
+            return None
+        workspace = inputs["test_workspace"]
+        workspace.target.path = relative
+        workspace.writable = {relative}
+        workspace.allow_write = lambda path: False
+
+        def gate():
+            if not (output / relative).is_file():
+                raise ValueError("Create the task.test_path suite with edit_file")
+            compiled = checks.typecheck([relative], full_source=False)
+            if compiled["returncode"]:
+                raise ValueError(compiled["output"])
+            return compiled
+        try:
+            agent = run_file_agent(model, TEST_INSTRUCTIONS, {**inputs["test_context"], "test_path": relative},
+                workspace, gate, max_turns, console, f"E2E {rid} / Parallel Test Generation",
+                feedback_filter=lambda value: source_selection.feedback(workspace, value))
+        except BaseException:
+            # Leave no half-written suite: the sequential loop regenerates it with its normal gate.
+            (output / relative).unlink(missing_ok=True)
+            raise
+        return agent["turns"]
+
+    generated_ahead = {}
+    if len(tree.leaves) > 1 and parallel_agents() > 1:
+        console.show("E2E | Parallel test generation",
+            f"Writing smoke suites for {len(tree.leaves)} requirements with up to {parallel_agents()} "
+            "concurrent agents; implementation and regression stay sequential.")
+        for rid, outcome in run_parallel(pregenerate, tree.leaves).items():
+            if isinstance(outcome, BaseException):
+                generated_ahead[rid] = {"error": str(outcome)[:2000]}
+            elif outcome is not None:
+                generated_ahead[rid] = {"turns": outcome}
+        checkpoint(output, stage="10", task="smoke tests", action="Generate smoke suites in parallel",
+            details={"generated": sorted(rid for rid, value in generated_ahead.items() if "turns" in value),
+                "failed": sorted(rid for rid, value in generated_ahead.items() if "error" in value)})
+
+    for number, rid in enumerate(tree.leaves, 1):
+        steps = tree.own_steps[rid]
+        label = f"E2E requirement {number}/{len(tree.leaves)} {rid}"
+        inputs = scenario_inputs(rid, selection)
+        if inputs is None:
+            report["requirements"][rid] = {"status": "NO_TRIGGERS", "triggers": []}
+            save_json(arc_dir / "frontend_e2e.json", report)
+            continue
+        tids, context, pages = inputs["tids"], inputs["context"], inputs["pages"]
+        rid_specs, relative, called = inputs["rid_specs"], inputs["relative"], inputs["called"]
+        test_context, test_workspace = inputs["test_context"], inputs["test_workspace"]
+        targets = tids
+        ui_files = [ui_test_path(pid) for pid in pages if (output / ui_test_path(pid)).is_file()]
         console.show(label + " | Scenario context", json.dumps(context, ensure_ascii=False, indent=2))
         report["requirements"][rid] = {"status": "GENERATING_TESTS", "triggers": sorted(tids),
             "target_triggers": sorted(targets), "test_path": relative}
+        if rid in generated_ahead:
+            report["requirements"][rid]["parallel_test_generation"] = generated_ahead[rid]
         save_json(arc_dir / "frontend_e2e.json", report)
         with implementation_task(output, report["requirements"][rid], console, "12 / " + rid):
             regression_files = [test_path(key, output) for key in [*accepted, rid]]
@@ -317,14 +475,6 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                     behavior = {"returncode": 1, "output": str(error), "errors": [str(error)]}
                 return {"typecheck": compiled, "behavior": behavior, "status": test_run_status(behavior)}
 
-            test_context = {**model_context(context), "schema": related_schema(schema, context["backend_apis"].values()), "test_path": relative if (output / relative).is_file() else None,
-                "max_tests": max_tests}
-            test_workspace = selection.workspace(target=("e2e_test", rid), existing=relative,
-                references=["frontend/src/ui-runtime.ts", CONFIG, FIXTURE, "backend/tests/support/context.ts",
-                    *selection.paths("page", pages), *APPLICATION_ENTRYPOINTS,
-                    "frontend/package.json", "frontend/tsconfig.json",
-                    *backend_selection.paths("api", called),
-                    *[f"backend/src/db/tables/{name}.sql" for name in related_schema(schema, context["backend_apis"].values())]])
             agent, generation_feedback = None, None
             if (output / relative).is_file():
                 try:
@@ -372,7 +522,8 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                             raise ValueError(result[kind]["output"])
                     if "backend_tests" in result:
                         require_backend_green(result["backend_tests"])
-                    if test_run_status(result["e2e"]) != "GREEN":
+                    # UNVERIFIED (no launchable browser) leaves typecheck/backend checks as the gate.
+                    if test_run_status(result["e2e"]) not in ("GREEN", "UNVERIFIED"):
                         raise ValueError("Functional scenarios require passing, unskipped and stable results")
                     if "ui" in result:
                         require_green(result["ui"])
@@ -391,11 +542,19 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                 "application_entrypoints": list(APPLICATION_ENTRYPOINTS),
                 "backend_entrypoints": {"registry": "backend/src/api/register.ts",
                     "app": "backend/src/app.ts", "server": "backend/src/server.ts"}}
+            if rid_specs:
+                task["supplied_acceptance_specs"] = {"paths": rid_specs, "helpers": supplied_helpers,
+                    "note": "Authoritative grader contract for this requirement (read-only). They run "
+                        "later against the production build with a fresh database seeded at startup and "
+                        "may rely on requirements implemented later; implement the roles, accessible "
+                        "names, routes and flows they use. They are not part of this task's gate."}
             workspace = selection.workspace(paths=[*selection.paths("page", pages), "frontend/src/style.css"],
                 references=[relative, *ui_files, "backend/tests/support/context.ts",
                     "frontend/src/ui-runtime.ts", CONFIG, *APPLICATION_ENTRYPOINTS,
-                    "frontend/package.json", "frontend/tsconfig.json"])
+                    "frontend/package.json", "frontend/tsconfig.json", *rid_specs,
+                    *(supplied_helpers if rid_specs else []), *startup_references(output)])
             workspace.allow_write = lambda path: editable_runtime_path(output, path)
+            protect_workspace(workspace)
             backend_selection.include(workspace, [*backend_selection.paths("api", called),
                 *[path for aid in called if (path := selected_path(output, "backend_test", aid))]])
 
@@ -456,3 +615,9 @@ def verify_frontend(arc_dir, tree, backend, ui, console, report):
     complete_report(report, report["requirements"].values(), verification)
     save_json(arc_dir / "frontend_e2e.json", report)
     return report
+
+
+# Requirement-declared role/name contracts bind both the smoke tests and the implementation.
+TEST_INSTRUCTIONS = TEST_INSTRUCTIONS + "\n\n" + CONTRACT_RULES + (
+    "Locate every contracted element with getByRole(ROLE, {name: NAME, exact: true}) exactly as declared.\n")
+IMPLEMENT_INSTRUCTIONS = IMPLEMENT_INSTRUCTIONS + "\n\n" + CONTRACT_RULES

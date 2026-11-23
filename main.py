@@ -6,7 +6,7 @@ import sys
 
 from infrastructure.compiler import Compiler, PIPELINE
 from infrastructure.utils.cli import resolve_directories
-from infrastructure.utils.presentation.logging import configure_console
+from infrastructure.utils.presentation.logging import configure_console, install_live_mirror
 from infrastructure.utils.presentation.stages import stage_label
 
 
@@ -27,6 +27,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stage", choices=[name for name, _, _ in PIPELINE], metavar="STAGE",
         help="Run one stage by its full name (e.g. 06_implement_backend_tdd); omit for the full pipeline")
     parser.add_argument("--pause", action="store_true", help="Wait for Enter after each display stage")
+    parser.add_argument("--keep-output", action="store_true",
+        help="Full runs normally start fresh (keeping node_modules and git history); reuse existing generated sources instead")
     args = parser.parse_args(argv)
     try:
         if not 1 <= args.port <= 65535:
@@ -46,9 +48,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     configure_console()
+    install_live_mirror()
     args = parse_args(argv)
+    print(f"Requirement compiler starting | input: {args.requirement_path} | output: {args.output_dir} | "
+        f"stage: {args.stage or 'full pipeline'}", flush=True)
     compiler = Compiler(args.requirement_path, args.output_dir,
-        model_log=args.model_log, port=args.port, pause=args.pause)
+        model_log=args.model_log, port=args.port, pause=args.pause, keep_output=args.keep_output)
     try:
         compiler.compile(stage=args.stage)
     except KeyboardInterrupt:

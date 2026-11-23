@@ -2,14 +2,19 @@
 
 import json
 
-from infrastructure.shared.agent.discovery import DISCOVERY_RULES, DiscoverySession
+from infrastructure.shared.agent.discovery import DISCOVERY_RULES, DiscoverySession, DiscoveryStalled
 from infrastructure.shared.agent.conventions import task_conventions
 
 from infrastructure.shared.agent.tools import FileTools
+from infrastructure.shared.agent.tools.files import FileToolError
 from infrastructure.shared.agent.tools.protocol import FILE_TOOL_RULES
-from infrastructure.shared.agent.proposals import RESPONSE_ERRORS, response_feedback
+from infrastructure.shared.agent.proposals import RESPONSE_ERRORS, compiler_bug, request_json, response_feedback
 from infrastructure.shared.project.git import checkpoint
 from infrastructure.utils.files import read_source
+
+
+# Reads and context lookups do not spend edit rounds, but one round may not read forever.
+MAX_CONTEXT_CALLS_PER_ROUND = 12
 
 
 class AgentExhausted(ValueError):
@@ -23,7 +28,7 @@ class AgentExhausted(ValueError):
 
 def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
         max_turns: int, console, label: str, feedback=None, feedback_filter=None, context_index=None,
-        allow_discovery=True) -> dict:
+        allow_discovery=True, task_complexity="high") -> dict:
     """Refresh files and paths; optionally select failure-related files before repair.
 
     The stage-owned feedback filter may add writable sources/read-only references
@@ -73,8 +78,9 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                     rules += "\n\n" + DISCOVERY_RULES
                 else:
                     rules += "\nSemantic discovery is disabled for this task. Use supplied evidence and read_file only."
-                return model.generate_json(rules, request)
+                return request_json(model, rules, request, task_complexity=task_complexity)
             response = request_model()
+            context_calls = 0
             while isinstance(response, dict):
                 if "context_request" in response:
                     if not allow_discovery:
@@ -90,8 +96,15 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                 elif "tool_calls" in response and files.effect(response["tool_calls"]) == "read":
                     calls = response["tool_calls"]
                     console.show(label + " | Read files", str([call["path"] for call in calls]))
-                    results = files.execute(calls)
-                    observation = {"tool_results": results}
+                    # Execute each read on its own: one bad path must not discard the other
+                    # reads or spend an edit round. Failures go back as read_errors.
+                    results, read_errors = [], []
+                    for number, call in enumerate(calls, 1):
+                        try:
+                            results.extend(files.execute([call]))
+                        except FileToolError as error:
+                            read_errors.append({"tool": call.get("tool"), "path": call.get("path"),
+                                "error": {**error.feedback, "call_index": number}})
                     for item in results:
                         record = item["result"]
                         excerpts = read_files.setdefault(record["path"], [])
@@ -100,11 +113,21 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                             record["start_line"] <= old["start_line"] and record["end_line"] >= old["end_line"])]
                         excerpts.append(record)
                     context_result = {"read_paths": [item["result"]["path"] for item in results]}
-                    observed = discovery.observe(observation)
+                    if read_errors:
+                        context_result["read_errors"] = read_errors
+                        console.show(label + " | Read errors", json.dumps(read_errors, ensure_ascii=False))
+                    try:
+                        observed = discovery.observe({"tool_results": results, "read_errors": read_errors})
+                    except DiscoveryStalled as error:
+                        observed = {"next_action": str(error) + " Stop reading; return edit_file tool_calls now."}
                     if observed.get("next_action"):
                         context_result["next_action"] = observed["next_action"]
                 else:
                     break
+                context_calls += 1
+                if context_calls >= MAX_CONTEXT_CALLS_PER_ROUND:
+                    raise ValueError(f"Too many read requests ({context_calls}) in one round; edit now. "
+                        "Return edit_file tool_calls based on the evidence already supplied.")
                 response = request_model()
             if isinstance(response, dict) and response.get("diagnosis"):
                 console.show(label + " | Failure diagnosis", json.dumps(response["diagnosis"], ensure_ascii=False, indent=2))
@@ -135,6 +158,8 @@ def run_file_agent(model, instructions: str, task: dict, files: FileTools, gate,
                 details={"round": turn, "checks": checks})
             return {"turns": turn, "checks": checks}
         except (*RESPONSE_ERRORS, RuntimeError, OSError) as error:
+            if compiler_bug(error):
+                raise  # wrong model-client call signature: a compiler defect, not model output
             message = str(error)
             console.show(f"{label} | Repair feedback", message)
             rejected = (getattr(error, "feedback", {"error": message}) if applied

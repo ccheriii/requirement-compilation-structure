@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 
 from infrastructure.shared.agent.context import SourceFiles
 from infrastructure.shared.agent.discovery import project_index
@@ -12,11 +13,13 @@ from infrastructure.stages.backend.context import load_context, requirement_cont
 from infrastructure.utils.files import read_artifact
 from infrastructure.stages.backend.runtime import REGISTER_PATH, TEST_RUNNER_PATH, TEST_SUPPORT_PATH, prepare_runtime, test_path
 from infrastructure.stages.backend.testing import BackendChecks, require_green, test_run_status
+from infrastructure.stages.database.runtime import ensure_password_module
 from infrastructure.shared.models.text import TextModel
 from infrastructure.utils.presentation.console import DemoConsole
 from infrastructure.shared.project.dependencies import install_dependencies
-from infrastructure.utils.files import save_json
+from infrastructure.utils.files import save_json, save_text
 from infrastructure.shared.project.git import checkpoint
+from infrastructure.stages.requirements.contracts import shared_clock
 
 
 TEST_INSTRUCTIONS = """Write one HTTP acceptance suite for task.api before implementing it.
@@ -47,14 +50,27 @@ when validating status/Location. Node fetch does not maintain browser cookies: o
 required cookies from real responses using headers.getSetCookie(), strip attributes and
 send them in a Cookie header for subsequent requests when this API requires it. Supply
 only contract-required authentication; do not test another requirement's login flow as
-an incidental dependency. Necessary existing sessions/accounts can be prepared via SQL.
+an incidental dependency. A necessary existing session for a seeded account can be
+prepared by inserting a session row via SQL.
 
-Seed only required Given state directly through database with parameterized SQL and valid
-values; use 0/1 booleans. Read the actual shared helper/SQL definitions rather than guessing
-fixture arguments or password encodings. Initialization loads db/seeds/ENTITY.sql; reuse
-existing prerequisites instead of assuming empty tables or duplicating identities. Arrange
-scenario-specific absence/conflicting states in this isolated database. Do not invoke
-another requirement's registration/creation API to manufacture Given data.
+Records named by concrete identities in Given text (specific usernames, credentials,
+titles, codes) are provided by startup seeds: backend/src/db/seed.ts loads the supplied
+backend/src/db/seeds/ENTITY.sql files on every initialization, and createApiTest restores
+them before each case. Use those records exactly as seeded (same identity values and
+plaintext passwords as stated in the requirement). Never INSERT, UPDATE or DELETE them in
+fixtures (unless a scenario's own Given explicitly requires that record absent or changed),
+and never insert a second copy. When Given names such a record, at least one success case
+must use it through HTTP with no fixture writes at all, so seed/handler compatibility (for
+example a seeded password hash verified by login) is exercised. If a needed seeded record
+is absent, fail the assertion instead of inserting it; the seed is the defect.
+Fixture SQL is only for generic or scenario-specific state (absence, extra rows,
+conflicting states, sessions). Use parameterized SQL with valid values and 0/1 booleans;
+read the actual shared helper/SQL definitions rather than guessing fixture arguments.
+Fixture password hashes use fixturePasswordHash, the same format as db/password.ts.
+Do not invoke another requirement's registration/creation API to manufacture Given data.
+Unless the requirement states a format rule for them, generate new identities with values
+containing hyphens and digits (for example a `case-${randomUUID().slice(0, 18)}` style
+username) so invented restrictions are caught.
 
 Within max_tests cover meaningful success and critical requirement-defined rejection.
 Assert relevant persisted results/forbidden writes with SQL where needed; HTTP is the
@@ -86,12 +102,37 @@ Use the supplied test utilities and generated tests to understand existing fixtu
 conventions. Preserve compatibility when reading those records. Production storage must
 satisfy the contract and keep plaintext passwords out of persistent data.
 Preserve required comparison rules and shared credential/header conventions.
+Every timestamp a handler stores or compares (created/updated/viewed times, expiries, \"today\") MUST come
+from now()/nowIso() in backend/src/clock.ts (relative .js import), never Date.now() or new Date() directly:
+it implements the requirements' shared application clock.
+Credential handlers MUST import { hashPassword, verifyPassword } from the db/password
+module (backend/src/db/password.ts, relative .js ESM import such as "../db/password.js")
+to store and check password hashes; implement no other hashing scheme. Seeds
+(seed_password_hash) and test fixtures use the same encoding, so seeded accounts can
+sign in with their stated plaintext passwords.
+
+Validate only rules the requirement or contract states: required fields, enums, matching
+values, exact comparisons. Do not add length limits, patterns, character classes, case or
+format checks the requirement does not state. Unless a stated rule restricts them, free-text
+identity values (names, usernames, document numbers) accept any non-empty value up to 255
+characters, including hyphens, digits and mixed case.
+
+Sessions, unless the contract or shared conventions state otherwise: an opaque random
+token (node:crypto randomBytes) stored in the persistent session table; set-cookie
+NAME=TOKEN; Path=/; HttpOnly; SameSite=Lax with no Secure flag and no short Max-Age.
+The read-only current-user endpoint returns 200 with an explicit signed-out body for a
+missing, unknown or invalidated token (never 401/500) and does not write. Logout deletes the
+server session row and clears the cookie with the same name, Path=/ and Max-Age=0. Parse
+the Cookie request header tolerantly (several cookies, whitespace, missing header).
+When a credential field's label names several identifier kinds (for example
+"Email/Username/Mobile number"), resolve the account by an exact match on any of those
+identifiers the schema stores.
 
 Do not start a server, open another database, change schema or seed production data.
 Use installed dependencies and Node standard modules. Implement the operation directly;
 no DB-access primitive layer is generated. The compiler owns the HTTP test runner and fixture.
-Predefined credentials in seeds/*.sql use seed_password_hash; its scrypt encoding is
-defined in backend/src/db/seed.ts and must remain readable by credential handlers.
+Predefined credentials in seeds/*.sql use seed_password_hash, which calls hashPassword
+from backend/src/db/password.ts; credential handlers verify them with verifyPassword.
 Read and edit task.api_wiring.registry to import this handle and register its actual
 Express route, adapting params/query/body/headers and status/body/headers between HTTP
 and the handler contract. Inspect app/server wiring when needed. The compiler will not
@@ -113,6 +154,45 @@ failures without weakening assertions or detecting tests to fake business behavi
 """
 
 
+ROUTE_PATTERN = re.compile(r"""\bapp\.(get|post|put|patch|delete|all)\(\s*(["'`])([^"'`]+)\2""")
+
+
+CLOCK_PATH = "backend/src/clock.ts"
+CLOCK_SOURCE = """// Compiler-owned application clock. The requirements declare a shared application/evaluator
+// clock; timestamps start at that instant and advance with real elapsed time, so "now",
+// relative dates and recency ordering agree with the evaluator while records stay ordered.
+const DECLARED: string | null = __CLOCK__;
+const startedAt = Date.now();
+
+export function now(): Date {
+  return DECLARED ? new Date(Date.parse(DECLARED) + (Date.now() - startedAt)) : new Date();
+}
+
+export function nowIso(): string {
+  return now().toISOString();
+}
+"""
+
+
+def write_clock_module(output: Path, clock) -> None:
+    """Publish backend/src/clock.ts (real time when the requirements declare no clock)."""
+    save_text(output / CLOCK_PATH, CLOCK_SOURCE.replace("__CLOCK__", json.dumps(clock)))
+
+
+def duplicate_routes(output: Path) -> list[str]:
+    """Return METHOD path pairs registered more than once; Express silently serves only the first."""
+    registry = output / REGISTER_PATH
+    if not registry.is_file():
+        return []
+    seen, duplicates = set(), []
+    for method, _quote, route in ROUTE_PATTERN.findall(registry.read_text(encoding="utf-8-sig")):
+        key = f"{method.upper()} {route}"
+        if key in seen and key not in duplicates:
+            duplicates.append(key)
+        seen.add(key)
+    return duplicates
+
+
 def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 10, max_tests: int = 5) -> dict:
     if max_turns < 1:
         raise ValueError("--max-turns must be positive")
@@ -126,7 +206,10 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
     for name in schema["entities"]:
         if not (output / f"backend/src/db/tables/{name}.sql").is_file():
             raise ValueError(f"Missing implemented SQL for {name}; run step 04")
+    # The test helper and credential handlers import the shared password module.
+    ensure_password_module(output)
     prepare_runtime(output)
+    write_clock_module(output, shared_clock(tree))
     console = DemoConsole(pause)
     console.show("TDD preparation | Install dependencies", f"Workspace: {output}\nCommand: npm install --include=dev --no-audit --no-fund")
     install_dependencies(output)
@@ -209,7 +292,7 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
                         "support_module": TEST_SUPPORT_PATH,
                     }
                     workspace = selection.workspace(target=("backend_test", aid), existing=relative,
-                        references=[*supplied_sources(output, api, schema)])
+                        references=[*supplied_sources(output, api, schema), REGISTER_PATH])
                     agent = run_file_agent(model, TEST_INSTRUCTIONS, context, workspace,
                         test_gate, max_turns, console, label + " / Test Generation",
                         feedback_filter=lambda value: selection.feedback(workspace, value), context_index=context_index)
@@ -234,6 +317,12 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
                         return {"typecheck": compiled, "tests": tested}
 
                     def implementation_gate():
+                        duplicates = duplicate_routes(output)
+                        if duplicates:
+                            raise ValueError(f"{REGISTER_PATH} registers these routes more than once: {', '.join(duplicates)}. "
+                                "Express serves only the FIRST registration, so later handlers never run and tests observe "
+                                "the stale handler. Keep exactly one registration per METHOD path, bound to this API's "
+                                "handler, and remove superseded handlers/imports.")
                         result = implementation_checks()
                         if result["typecheck"]["returncode"]:
                             raise ValueError(result["typecheck"]["output"])

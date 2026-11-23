@@ -7,5 +7,6 @@ slides/
 docs/
 /scripts/*
 !/scripts/package.py
+!/scripts/acceptance.py
 
 AGENTS.md

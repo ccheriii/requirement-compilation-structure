@@ -13,8 +13,11 @@ from infrastructure.shared.agent.loop import run_file_agent
 from infrastructure.shared.agent.recovery import implementation_task, final_checks, complete_report
 from infrastructure.shared.project.entrypoints import selected_path
 from infrastructure.stages.frontend.ui.design import owners, page_context
+from infrastructure.stages.requirements.contracts import CONTRACT_RULES
 from infrastructure.stages.frontend.ui.runtime import APPLICATION_ENTRYPOINTS, prepare_frontend
-from infrastructure.stages.frontend.ui.testing import FrontendChecks, existence_suite, require_green, test_path
+from infrastructure.stages.frontend.browser import is_unverified
+from infrastructure.stages.frontend.ui.testing import (FrontendChecks, accessible_contract, existence_suite,
+    require_green, stale_compiler_suite, test_path)
 from infrastructure.shared.project.dependencies import install_dependencies
 from infrastructure.utils.files import save_json, save_text
 from infrastructure.shared.project.git import checkpoint
@@ -42,13 +45,16 @@ asynchronous loading and cancel/reset. Keep the input's value separate from visi
 validation and other dependent state. Do not rely on compiler event capture or automatic
 input synchronization; no such host is generated.
 
-Render real layout, labels, controls and conditional content with original text and stable
-data-testid=ELEMENT_ID selectors. Use the installed dependencies and configured styles.
+Render the designed layout, labels, controls and conditional content with original text and
+stable data-testid=ELEMENT_ID selectors. Use the installed dependencies and configured styles.
+Visual references guide appearance only: reproduce reference chrome that the design does not
+declare as a functional control (brand, menus, carousels, footers) as non-interactive text or
+images, never as extra links, buttons or form fields.
 Preserve every explicitly required UI name and role verbatim, including language, spelling
 and case. Do not rename "Name" to "Shelf name", translate captions, or combine aliases.
 Keep visible labels and computed accessible names consistent: associate labels correctly,
 and do not override them with a different aria-label or concatenate unrelated text through
-aria-labelledby. Use exact placeholders only when the requirement specifies placeholders;
+aria-labelledby. Use exact placeholders only when the requirement or design prop.placeholder specifies them;
 an accessible field name alone does not prescribe a placeholder or HTML implementation.
 Apply this to buttons, links, headings and named regions as well as form fields. If the
 generated design or reference image conflicts with an explicit original UI contract, follow
@@ -69,6 +75,33 @@ The compiler compiles, runs current/accepted presence tests and builds; it never
 App, routes, handlers or stores. Repair relevant writable sources without removing previous
 behavior. Diagnose incorrect tests against original requirements and preserve meaningful
 control/data-key assertions. Shared test/build infrastructure remains read-only.
+
+ROLE/NAME CONVENTIONS (tests locate controls by ARIA role and exact accessible name, strict mode)
+page.accessible_contract lists the page's functional controls with role, name, input_type,
+options and href. Each role+name pair must resolve to exactly one element while visible.
+Everything else taken from visual_references is decoration.
+- Fields: <label htmlFor=ID> whose text is exactly the declared label, on an input with that id.
+  Required markers and icons go in separate aria-hidden="true" spans; never add text through CSS
+  ::before/::after content on labels, buttons or links. Never nest links or buttons inside the
+  label that names an input.
+- input_type password -> <input type="password">. Date-like fields -> <input type="text"
+  placeholder="YYYY-MM-DD"> accepting typed ISO dates (never type="date"/"number"/"search").
+- select -> native <select> whose <option> text equals each option caption exactly, with the
+  requirement default preselected.
+- radiogroup -> <div role="radiogroup" aria-labelledby=LABEL_ID> (LABEL_ID is an element holding the
+  exact group label) containing one <label><input type="radio" name=GROUP /> Option</label> per
+  option. A <fieldset> alone is role "group", not "radiogroup".
+- Native checkboxes and radios stay visible and clickable: no display:none, opacity:0, zero size or
+  overlay elements intercepting clicks.
+- Links are <a href> (or the router's Link) with the exact caption; buttons are <button> with the
+  exact caption; a form's submit button has type="submit".
+- Render a single role="alert" element only while an error exists; static notes never use role alert.
+- Conditional controls and identity text are not rendered at all when hidden (conditional JSX),
+  not hidden with CSS. A displayed dynamic value (e.g. a user name) sits alone in its own element.
+- Each functional accessible name appears once per page. Decorative reference chrome is only
+  non-interactive text or images, preferably inside an aria-hidden="true" wrapper, and never
+  repeats a functional control's name.
+- Do not invent maxLength, pattern or other validation that the requirement does not state.
 """
 
 
@@ -98,7 +131,8 @@ def implement_ui(arc_dir: Path, design: dict, model, console, report: dict, max_
         uses = owners(design, pid)
         relative = test_path(pid)
         suite = existence_suite(design, pid)
-        if not (output / relative).is_file():
+        # The suite is compiler-owned: rewrite it when an older generator version produced it.
+        if not (output / relative).is_file() or stale_compiler_suite((output / relative).read_text(encoding="utf-8")):
             save_text(output / relative, suite)
         report["pages"][pid] = {"status": "TESTS_READY", "requirements": uses, "test_path": relative}
         save_json(arc_dir / "ui_checks.json", report)
@@ -132,26 +166,31 @@ def implement_ui(arc_dir: Path, design: dict, model, console, report: dict, max_
             except (ValueError, RuntimeError) as error:
                 current = {"error": str(error), "typecheck": None, "tests": None}
             if current["tests"] is not None:
-                report["pages"][pid]["status"] = "GREEN" if not current["tests"]["returncode"] else "REPAIR_REQUIRED"
+                report["pages"][pid]["status"] = ("UNVERIFIED" if is_unverified(current["tests"])
+                    else "GREEN" if not current["tests"]["returncode"] else "REPAIR_REQUIRED")
                 console.show(label + " | " + report["pages"][pid]["status"], current["tests"]["output"])
             save_json(arc_dir / "ui_checks.json", report)
-            if current["tests"] and current["tests"]["returncode"] == 0:
+            # Without a browser (unverified) the page is always implemented by the agent.
+            if current["tests"] and current["tests"]["returncode"] == 0 and not is_unverified(current["tests"]):
                 agent = {"turns": 0, "checks": current}
             else:
-                context = {"page": page_context(design, pid), "application_entrypoints": list(APPLICATION_ENTRYPOINTS),
+                context = {"page": {**page_context(design, pid), "accessible_contract": accessible_contract(design, pid)},
+                    "application_entrypoints": list(APPLICATION_ENTRYPOINTS),
                     "requirements": [{key: value for key, value in (requirement_contexts or {}).get(rid, {"id": rid}).items() if key != "images"}
                         for rid in uses],
                     "visual_references": {iid: (images or {})[iid] for iid in design["pages"][pid]["images"]},
                     "implementation_path": selected_path(output, "page", pid)}
                 workspace = selection.workspace(target=("page", pid),
                     references=["frontend/src/ui-runtime.ts", relative, "frontend/package.json",
-                        "frontend/tsconfig.json", "frontend/playwright.ui.config.ts", *APPLICATION_ENTRYPOINTS])
+                        "frontend/tsconfig.json", "frontend/playwright.ui.config.ts", *APPLICATION_ENTRYPOINTS,
+                        *[path for path in ("frontend/src/style.css",) if (output / path).is_file()]])
                 report["pages"][pid]["status"] = "IMPLEMENTING"
                 agent = run_file_agent(model, INSTRUCTIONS, context, workspace, implementation_gate,
                     max_turns, console, label + " / Implementation", feedback=current,
                     feedback_filter=lambda value: selection.feedback(workspace, value), context_index=context_index)
             accepted.append(pid)
-            report["pages"][pid].update({"status": "GREEN", "turns": agent["turns"],
+            report["pages"][pid].update({"status": "UNVERIFIED" if is_unverified(agent["checks"]["tests"]) else "GREEN",
+                "turns": agent["turns"],
                 "implementation_path": selected_path(output, "page", pid),
                 "checks": {key: value for key, value in agent["checks"]["tests"].items() if key != "output"}})
             save_json(arc_dir / "ui_checks.json", report)
@@ -168,3 +207,7 @@ def implement_ui(arc_dir: Path, design: dict, model, console, report: dict, max_
     complete_report(report, report["pages"].values(), verification)
     save_json(arc_dir / "ui_checks.json", report)
     return report
+
+
+# Requirement-declared role/name contracts are exact interface obligations for every page.
+INSTRUCTIONS = INSTRUCTIONS + "\n\n" + CONTRACT_RULES

@@ -38,9 +38,13 @@ class TeeStream:
         self.terminal, self.log, self.lock = terminal, log, lock
 
     def write(self, text: str) -> int:
-        """Mirror text to the terminal and log, immediately flushing the log and returning the character count."""
+        """Mirror text to the terminal and log, flushing both so headless viewers stream it live."""
         with self.lock:
-            self.terminal.write(text)
+            try:
+                self.terminal.write(text)
+                self.terminal.flush()
+            except (OSError, ValueError):
+                pass  # a closed or broken viewer pipe must never stop compilation
             self.log.write(re.sub(r"\x1b\[[0-9;]*m", "", text))
             self.log.flush()
         return len(text)
@@ -48,19 +52,102 @@ class TeeStream:
     def flush(self) -> None:
         """Flush both destinations under the shared output lock."""
         with self.lock:
-            self.terminal.flush()
+            try:
+                self.terminal.flush()
+            except (OSError, ValueError):
+                pass
             self.log.flush()
 
     def __getattr__(self, name):
         """Delegate stream capabilities such as isatty to the original terminal."""
+        if name == "terminal":
+            raise AttributeError(name)
         return getattr(self.terminal, name)
 
 
+class MirrorStream:
+    """Process-wide stdout that also copies every write to a second live stream (stderr)."""
+    def __init__(self, primary, mirror) -> None:
+        self.primary, self.mirror, self.lock = primary, mirror, RLock()
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            for stream in (self.primary, self.mirror):
+                try:
+                    stream.write(text)
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass  # one broken viewer must not stop compilation or the other stream
+        return len(text)
+
+    def flush(self) -> None:
+        with self.lock:
+            for stream in (self.primary, self.mirror):
+                try:
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
+
+    def __getattr__(self, name):
+        """Delegate isatty, fileno, encoding and similar capabilities to the real stdout."""
+        if name == "primary":
+            raise AttributeError(name)
+        return getattr(self.primary, name)
+
+
 def configure_console() -> None:
-    """Use UTF-8 for real terminal/redirected streams while leaving capture streams usable."""
+    """Use UTF-8 and line buffering for real terminal/redirected streams.
+
+    A piped stdout is block-buffered by default, so a hosted runner's log view would
+    only receive output in 8 KB bursts (or at exit); line buffering streams every line."""
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+            except (OSError, ValueError):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _same_stream(first, second) -> bool:
+    """True when two standard streams write to the same file or pipe (e.g. 2>&1)."""
+    import os
+    try:
+        a, b = os.fstat(first.fileno()), os.fstat(second.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino) and a.st_ino != 0
+
+
+def live_mirror(stdout, stderr):
+    """Return the stream that should also receive console output, or None.
+
+    Hosted runners (no TTY) may display only stderr, where Python's logging writes.
+    Headless runs therefore mirror console output to stderr too, unless both streams
+    already reach the same destination or stderr is an interactive terminal.
+    ARC_LOG_STDERR=0 disables the mirror; ARC_LOG_STDERR=1 forces it."""
+    import os
+    setting = os.getenv("ARC_LOG_STDERR", "").strip().lower()
+    if setting in {"0", "false", "no", "off"}:
+        return None
+    if setting in {"1", "true", "yes", "on"}:
+        return stderr
+    try:
+        if stdout.isatty() or stderr.isatty():
+            return None
+    except (AttributeError, ValueError):
+        return None
+    return None if _same_stream(stdout, stderr) else stderr
+
+
+def install_live_mirror() -> bool:
+    """Mirror all console output to stderr for headless runs (see live_mirror); idempotent."""
+    if isinstance(sys.stdout, MirrorStream):
+        return True
+    mirror = live_mirror(sys.stdout, sys.stderr)
+    if mirror is None:
+        return False
+    sys.stdout = MirrorStream(sys.stdout, mirror)
+    return True
 
 
 @contextmanager
