@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from threading import RLock
 
 
 IGNORE_RULES = (
@@ -12,6 +13,11 @@ IGNORE_RULES = (
     ".env", ".env.*", "!.env.example", "compiler.log", "model_calls.jsonl", ".arc/model_logs/",
     "__pycache__/", ".venv/",
 )
+
+
+# Checkpoints stage and commit the whole tree; concurrent workers (parallel model
+# calls, background installs) must not race on .git/index.lock.
+_CHECKPOINT_LOCK = RLock()
 
 
 class GitError(RuntimeError):
@@ -139,18 +145,19 @@ def checkpoint(output=None, *, stage=None, task, action, status="GREEN", details
     if not (repository.directory / ".git").exists():
         return None
     try:
-        repository.require_root()
-        if repository.run("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() != "main":
-            raise GitError("Checkpoints require the output repository's main branch")
-        repository.add()
-        changed = repository.run("diff", "--cached", "--stat").stdout.strip()
-        title = " ".join(f"[{stage}] {task}: {action} ({status})".split())
-        message = (title + f"\n\nStage: {stage}\nTask: {task}\nAction: {action}\nStatus: {status}\n"
-            + "\nDetails:\n" + json.dumps(summarize(details or {}), ensure_ascii=False, indent=2)
-            + "\n\nChanged files:\n" + (changed or "No tracked file changes; execution checkpoint.") + "\n")
-        revision = repository.commit(message)
-        print(f"[GIT] {revision[:8]} {title}", flush=True)
-        return revision
+        with _CHECKPOINT_LOCK:
+            repository.require_root()
+            if repository.run("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip() != "main":
+                raise GitError("Checkpoints require the output repository's main branch")
+            repository.add()
+            changed = repository.run("diff", "--cached", "--stat").stdout.strip()
+            title = " ".join(f"[{stage}] {task}: {action} ({status})".split())
+            message = (title + f"\n\nStage: {stage}\nTask: {task}\nAction: {action}\nStatus: {status}\n"
+                + "\nDetails:\n" + json.dumps(summarize(details or {}), ensure_ascii=False, indent=2)
+                + "\n\nChanged files:\n" + (changed or "No tracked file changes; execution checkpoint.") + "\n")
+            revision = repository.commit(message)
+            print(f"[GIT] {revision[:8]} {title}", flush=True)
+            return revision
     except GitError as error:
         print(f"[GIT WARNING] Checkpoint failed for {task}: {error}", flush=True)
         return None

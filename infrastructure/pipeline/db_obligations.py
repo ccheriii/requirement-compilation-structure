@@ -1,6 +1,9 @@
 """Step 03: infer database read/write obligations for every requirement and step."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
+import os
 from pathlib import Path
 
 from infrastructure.shared.models.text import TextModel
@@ -79,51 +82,73 @@ def infer_db_obligations(arc_dir: Path, pause: bool = False, top_k: int = 6, max
 
     failures = TaskFailures(arc_dir, "03_infer_db_obligations", console)
     save_json(arc_dir / "db_obligations.json", obligations)
-    for index, rid in enumerate(tree.leaves, 1):
-        with failures.task(rid):
-            requirement = tree.requirements[rid]
-            label = f"{index}/{len(tree.leaves)} {rid}"
-            steps_text = tree.concatenated_steps(rid)
-            console.show(f"{label} | 1. Current requirement and steps", (
-                f"{requirement['name']}\n\nDescription:\n{requirement['description']}"
-                f"\n\nConcatenated steps:\n{steps_text or '(No steps on this requirement.)'}"
-            ))
-            related_fields = schema["requirements"].get(rid)
-            try:
-                check_related_fields(schema, related_fields)
-            except ValueError as error:
-                raise ValueError(f"Invalid schema associations for {rid} in .arc/db_schema.json. "
-                    f"Rerun main.py --stage 02 to repair the schema before inference. {error}") from error
-            related_entities = {}
-            for symbol in related_fields:
-                entity, field = symbol.split(".", 1)
-                related_entities.setdefault(entity, {"description": schema["entities"][entity]["description"], "fields": {}})
-                related_entities[entity]["fields"][field] = schema["entities"][entity]["fields"][field]
-            console.show(f"{label} | 2. Related schema fields", format_schema(related_entities))
-            # --- Extension point 03C: inference granularity and feedback -----------
-            # One call currently predicts a requirement and all its own steps.
-            # Try separate calls or richer evidence, while retaining every node ID
-            # and step-specific read/write sets. Report inconsistent inference
-            # for model correction rather than silently expanding its records.
-            request = {
-                "requirement": requirement,
-                "steps": [tree.steps[sid] for sid in tree.own_steps[rid]],
-                "related_fields": sorted(related_fields),
-                "related_schema": {"entities": related_entities},
-            }
-            def accept(response):
-                inferred = normalize_inference(response, tree.own_steps[rid])
-                check_symbols([inferred["requirement"], *inferred["steps"].values()], schema)
-                summary = format_obligations({rid: inferred["requirement"], **inferred["steps"]})
-                return inferred, summary
+    # Each requirement's inference reads only that requirement, its steps and the
+    # finished schema, never another requirement's obligations, so all model calls
+    # run concurrently. Results are published one by one in requirement order.
+    def prepare(index, rid):
+        requirement = tree.requirements[rid]
+        label = f"{index}/{len(tree.leaves)} {rid}"
+        steps_text = tree.concatenated_steps(rid)
+        console.show(f"{label} | 1. Current requirement and steps", (
+            f"{requirement['name']}\n\nDescription:\n{requirement['description']}"
+            f"\n\nConcatenated steps:\n{steps_text or '(No steps on this requirement.)'}"
+        ))
+        related_fields = schema["requirements"].get(rid)
+        try:
+            check_related_fields(schema, related_fields)
+        except ValueError as error:
+            raise ValueError(f"Invalid schema associations for {rid} in .arc/db_schema.json. "
+                f"Rerun main.py --stage 02 to repair the schema before inference. {error}") from error
+        related_entities = {}
+        for symbol in related_fields:
+            entity, field = symbol.split(".", 1)
+            related_entities.setdefault(entity, {"description": schema["entities"][entity]["description"], "fields": {}})
+            related_entities[entity]["fields"][field] = schema["entities"][entity]["fields"][field]
+        console.show(f"{label} | 2. Related schema fields", format_schema(related_entities))
+        # --- Extension point 03C: inference granularity and feedback -----------
+        # One call currently predicts a requirement and all its own steps.
+        # Try separate calls or richer evidence, while retaining every node ID
+        # and step-specific read/write sets. Report inconsistent inference
+        # for model correction rather than silently expanding its records.
+        return label, {
+            "requirement": requirement,
+            "steps": [tree.steps[sid] for sid in tree.own_steps[rid]],
+            "related_fields": sorted(related_fields),
+            "related_schema": {"entities": related_entities},
+        }
 
-            (inferred, summary), _ = propose_json(model, INSTRUCTIONS, request, accept,
-                console, f"Obligation inference {rid}", max_attempts, context_index=ContextIndex(lambda: {"schema": schema["entities"]}))
-            obligations["requirements"][rid] = inferred["requirement"]
-            obligations["steps"].update(inferred["steps"])
-            save_json(arc_dir / "db_obligations.json", obligations)
-            console.artifact("db_obligations", obligations, f"{label} | Accepted obligations")
-            console.show(f"{label} | 4. Inferred obligations", summary)
+    def infer(rid, request):
+        def accept(response):
+            inferred = normalize_inference(response, tree.own_steps[rid])
+            check_symbols([inferred["requirement"], *inferred["steps"].values()], schema)
+            summary = format_obligations({rid: inferred["requirement"], **inferred["steps"]})
+            return inferred, summary
+
+        (inferred, summary), _ = propose_json(model, INSTRUCTIONS, request, accept,
+            console, f"Obligation inference {rid}", max_attempts, context_index=ContextIndex(lambda: {"schema": schema["entities"]}))
+        return inferred, summary
+
+    prepared, errors = {}, {}
+    for index, rid in enumerate(tree.leaves, 1):
+        try:
+            prepared[rid] = prepare(index, rid)
+        except Exception as error:  # Recorded by failures.task below, in order.
+            errors[rid] = error
+    workers = 1 if pause else max(1, int(os.getenv("ARC_DESIGN_CONCURRENCY", "4") or 1))
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(prepared) or 1))) as pool:
+        futures = {rid: pool.submit(copy_context().run, infer, rid, request)
+            for rid, (_label, request) in prepared.items()}
+        for rid in tree.leaves:
+            with failures.task(rid):
+                if rid in errors:
+                    raise errors[rid]
+                label = prepared[rid][0]
+                inferred, summary = futures[rid].result()
+                obligations["requirements"][rid] = inferred["requirement"]
+                obligations["steps"].update(inferred["steps"])
+                save_json(arc_dir / "db_obligations.json", obligations)
+                console.artifact("db_obligations", obligations, f"{label} | Accepted obligations")
+                console.show(f"{label} | 4. Inferred obligations", summary)
 
     failures.finish()
     obligations = normalize_obligations(obligations, tree)

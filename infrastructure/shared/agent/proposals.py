@@ -38,6 +38,12 @@ def response_feedback(error, response):
 
 def propose_json(model, instructions, request, accept, console, label, max_attempts=10, context_index=None):
     """Generate and repair a proposal within a finite total model-call budget."""
+    from infrastructure.shared.models.text import reasoning_for
+    with reasoning_for("design", unless_set=True):
+        return _propose_json(model, instructions, request, accept, console, label, max_attempts, context_index)
+
+
+def _propose_json(model, instructions, request, accept, console, label, max_attempts, context_index):
     if max_attempts < 1:
         raise ValueError("--max-attempts must be positive")
     request = dict(request)

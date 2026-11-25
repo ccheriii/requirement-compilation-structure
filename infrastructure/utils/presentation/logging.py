@@ -1,6 +1,6 @@
 """Mirror step output to the terminal and an append-only workspace log."""
 
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -56,6 +56,66 @@ class TeeStream:
         return getattr(self.terminal, name)
 
 
+# Per-stage output routing. Stages may run concurrently (e.g. a design stage
+# alongside an implementation stage), so stdout/stderr cannot be swapped
+# process-wide per stage. A router installed once sends each write to the log
+# session of the context that produced it. Plain threads (which start with an
+# empty context) fall back to the most recently opened session.
+_route = ContextVar("compiler_output_route", default=None)
+_active_routes: list[dict] = []
+_routes_lock = RLock()
+# One lock for all sessions: concurrent stages append to the same compiler.log.
+_OUTPUT_LOCK = RLock()
+
+
+class RoutingStream:
+    """Process-wide stream that forwards to the current stage's TeeStream."""
+
+    def __init__(self, terminal, name) -> None:
+        self.terminal, self.name = terminal, name
+
+    def _target(self):
+        routes = _route.get()
+        if routes is None:
+            with _routes_lock:
+                routes = _active_routes[-1] if _active_routes else None
+        return routes[self.name] if routes else self.terminal
+
+    def write(self, text: str) -> int:
+        return self._target().write(text)
+
+    def flush(self) -> None:
+        self._target().flush()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
+
+def _install_router(name):
+    stream = getattr(sys, name)
+    if not isinstance(stream, RoutingStream):
+        stream = RoutingStream(stream, name)
+        setattr(sys, name, stream)
+    return stream
+
+
+@contextmanager
+def _routed_output(log):
+    """Route this context's stdout/stderr (and its copied child contexts) to log."""
+    stdout, stderr = _install_router("stdout"), _install_router("stderr")
+    routes = {"stdout": TeeStream(stdout.terminal, log, _OUTPUT_LOCK),
+        "stderr": TeeStream(stderr.terminal, log, _OUTPUT_LOCK)}
+    token = _route.set(routes)
+    with _routes_lock:
+        _active_routes.append(routes)
+    try:
+        yield routes
+    finally:
+        with _routes_lock:
+            _active_routes.remove(routes)
+        _route.reset(token)
+
+
 def configure_console() -> None:
     """Use UTF-8 for real terminal/redirected streams while leaving capture streams usable."""
     for stream in (sys.stdout, sys.stderr):
@@ -73,10 +133,9 @@ def console_log(output_dir: Path, *, debug_model_io: bool = False, model_log: bo
     initialize_repository(output_dir)
     configure_console()
     with (output_dir / "compiler.log").open("a", encoding="utf-8", newline="\n") as log:
-        lock = RLock()
-        stdout = TeeStream(sys.stdout, log, lock)
-        stderr = TeeStream(sys.stderr, log, lock)
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        lock = _OUTPUT_LOCK
+        with _routed_output(log) as routes:
+            stdout, stderr = routes["stdout"], routes["stderr"]
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             script = stage or Path(sys.argv[0]).name
             artifacts = {}

@@ -1,5 +1,7 @@
 """Small JSON-generating text model client."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,39 @@ from infrastructure.utils.presentation.model_io import http_client, invoke
 
 
 DEFAULT_MODEL = "deepseek-flash"
+REASONING_MODES = {"auto", "provider", "none", "low", "high", "max"}
+
+# Per-task reasoning. Every text call belongs to one kind of task; the effort
+# for a kind comes from MODEL_REASONING_<KIND> (e.g. MODEL_REASONING_TESTS=none)
+# and falls back to MODEL_REASONING. Kinds: design (propose_json stages),
+# implementation (file-editing agents, repairs, reviews), tests (writing test
+# suites). Image analysis already has VISUAL_REASONING.
+REASONING_KINDS = ("design", "implementation", "tests")
+_reasoning_kind = ContextVar("compiler_reasoning_kind", default=None)
+
+
+@contextmanager
+def reasoning_for(kind, *, unless_set=False):
+    """Mark model calls in this block (and contexts copied from it) as one task kind."""
+    if kind not in REASONING_KINDS:
+        raise ValueError(f"Unknown reasoning kind {kind!r}; use one of {REASONING_KINDS}")
+    if unless_set and _reasoning_kind.get() is not None:
+        yield
+        return
+    token = _reasoning_kind.set(kind)
+    try:
+        yield
+    finally:
+        _reasoning_kind.reset(token)
+
+
+def reasoning_mode(default):
+    """Effort for the current task kind: MODEL_REASONING_<KIND>, else the default."""
+    kind = _reasoning_kind.get()
+    value = (os.getenv(f"MODEL_REASONING_{kind.upper()}") or "").strip().lower() if kind else ""
+    if value and value not in REASONING_MODES:
+        raise ValueError(f"MODEL_REASONING_{kind.upper()} must be one of {sorted(REASONING_MODES)}")
+    return value or default
 
 JSON_OUTPUT_RULE = """OUTPUT PROTOCOL: return exactly one valid JSON object in the response content.
 The first non-whitespace character must be { and the last must be }.
@@ -96,13 +131,14 @@ class TextModel:
 
     def generate_json(self, instructions: str, payload: dict) -> dict:
         """Request JSON using the stage prompt and serialized task data."""
-        mode = getattr(self, "reasoning", "low")
+        mode = reasoning_mode(getattr(self, "reasoning", "low"))
         try:
             response = self._request(
                 model=self.name,
                 messages=[
                     {"role": "system", "content": instructions.rstrip() + "\n" + JSON_OUTPUT_RULE},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    # Compact separators: indentation/spaces are pure token overhead.
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
                 ],
                 **({"response_format": {"type": "json_object"}} if getattr(self, "json_mode", True) else {}),
                 **reasoning_arguments(self.name, mode),

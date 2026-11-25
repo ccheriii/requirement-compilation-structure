@@ -101,6 +101,23 @@ class FileTools:
             raise FileToolError("MIXED_TOOL_BATCH", "Separate read calls from edit calls; inspect reads before editing")
         return next(iter(effects), "write")
 
+    def read_batch(self, calls):
+        """Run read calls one by one; report failed reads instead of failing the batch.
+
+        A batch mixing an existing file with a not-yet-created one (common in
+        test-first tasks, whose implementation file is created later) used to
+        fail as a whole and cost the model an edit round without any content.
+        """
+        if self.effect(calls) != "read":
+            raise FileToolError("MIXED_TOOL_BATCH", "read_batch accepts read calls only")
+        results, failed = [], []
+        for call in calls:
+            try:
+                results.extend(self.execute([call]))
+            except FileToolError as error:
+                failed.append({"tool": call.get("tool"), "path": call.get("path"), "error": error.feedback})
+        return results, failed
+
     def execute(self, calls):
         """Validate/stage a complete edit batch, then publish or restore every affected file."""
         self.effect(calls)

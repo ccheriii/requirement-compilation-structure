@@ -1,6 +1,10 @@
 """Run all compilation passes or one selected pass in the same pipeline."""
 
+from contextvars import copy_context
+import os
 from pathlib import Path
+import queue
+from threading import RLock, Thread
 import traceback
 
 from infrastructure.pipeline.project_initialization import project_initialization
@@ -18,6 +22,8 @@ from infrastructure.utils.presentation.console import show_panel
 from infrastructure.utils.presentation.logging import console_log
 from infrastructure.utils.files import save_json
 from infrastructure.shared.project.git import checkpoint
+from infrastructure.shared.project.dependencies import EnvironmentFailure, cancel_prefetches, prefetch_dependencies
+from infrastructure.stages.frontend.ui.runtime import prepare_frontend
 
 
 PIPELINE = (
@@ -33,6 +39,34 @@ PIPELINE = (
     ("09_design_frontend_triggers", design_frontend_triggers, "frontend_triggers"),
     ("10_implement_frontend_tdd", implement_frontend_triggers, "frontend_e2e"),
 )
+
+# What each stage actually needs (verified per stage); a stage not listed needs
+# the previous one. In full runs a stage starts as soon as its needs are done:
+#   06 backend TDD  ─┐  (edits backend/ only)
+#   07 UI design ─┬─ 08 UI implementation (edits frontend/ only) ─┐
+#                 └─ 09 trigger design (writes .arc only) ─────────┴─ 10
+# 07 reads requirements/schema/backend_apis/visual analysis; 08 reads ui_design;
+# 09 reads ui_design and db_obligations. None reads 06's code or reports, and
+# 06/08 keep failure recovery to their own layer (implementation_task roots).
+# Disable with ARC_OVERLAP_STAGES=0; never used with --pause or --stage.
+STAGE_DEPENDENCIES = {
+    "06_implement_backend_tdd": ("05_design_backend_apis",),
+    "07_design_ui": ("05_design_backend_apis",),
+    "08_implement_ui": ("07_design_ui",),
+    "09_design_frontend_triggers": ("07_design_ui",),
+    "10_implement_frontend_tdd": ("06_implement_backend_tdd", "08_implement_ui", "09_design_frontend_triggers"),
+}
+STAGE_ORDER = {name: index for index, (name, _, _) in enumerate(PIPELINE)}
+
+
+def stage_needs(name, ordered):
+    """Stages that must finish before name starts, among the ordered stages being run."""
+    needs = STAGE_DEPENDENCIES.get(name)
+    if needs is None:
+        index = ordered.index(name)
+        needs = (ordered[index - 1],) if index > 0 else ()
+    return {need for need in needs if need in ordered}
+
 
 class Compiler:
     """Own shared paths, configuration, and results for one compilation."""
@@ -50,6 +84,14 @@ class Compiler:
         self.artifacts: dict[str, object] = {}
         self.current_stage: str | None = None
         self.report = {"status": "NOT_STARTED", "stages": {}}
+        self._report_lock = RLock()
+
+    def _record(self, stage, entry):
+        """Store a stage result in pipeline order and persist the report (thread-safe)."""
+        with self._report_lock:
+            stages = {**self.report["stages"], stage: entry}
+            self.report["stages"] = dict(sorted(stages.items(), key=lambda item: STAGE_ORDER.get(item[0], len(STAGE_ORDER))))
+            save_json(self.arc_dir / "compilation.json", self.report)
 
     def _run(self, stage: str, function, *arguments, **options):
         """Attempt every pass; keep failures explicit without aborting later passes."""
@@ -60,10 +102,18 @@ class Compiler:
                 result = function(*arguments, **options)
         except KeyboardInterrupt as error:
             self.report["status"] = "INTERRUPTED"
-            self.report["stages"][stage] = {"status": "INTERRUPTED", "error": str(error)}
-            save_json(self.arc_dir / "compilation.json", self.report)
+            self._record(stage, {"status": "INTERRUPTED", "error": str(error)})
             checkpoint(self.output_dir, stage=stage, task="stage report", action="Record interrupted pass",
                 status="INTERRUPTED", details=self.report["stages"][stage])
+            raise
+        except EnvironmentFailure as error:
+            # Later passes would hit the same machine problem; stop with the fix.
+            entry = {"status": "FAILED", "error": str(error), "error_type": type(error).__name__}
+            self.report["status"] = "FAILED"
+            self._record(stage, entry)
+            show_panel("[STOPPED] " + stage + " | environment problem", str(error), tone="error")
+            checkpoint(self.output_dir, stage=stage, task="stage report", action="Stop on environment failure",
+                status="FAILED", details=entry)
             raise
         except Exception as error:
             result = {"status": "FAILED", "error": str(error),
@@ -73,15 +123,73 @@ class Compiler:
             show_panel("[FAILED; continuing] " + stage,
                 result["error"] + "\nAccepted artifacts remain available. Attempt the next pass.", tone="error")
         status = result.get("status", "GREEN") if isinstance(result, dict) else "GREEN"
-        self.report["stages"][stage] = {"status": status}
+        entry = {"status": status}
         if isinstance(result, dict):
             for key in ("failures", "verification", "error", "error_type", "traceback"):
                 if key in result:
-                    self.report["stages"][stage][key] = result[key]
-        save_json(self.arc_dir / "compilation.json", self.report)
+                    entry[key] = result[key]
+        self._record(stage, entry)
         checkpoint(self.output_dir, stage=stage, task="stage report", action="Publish pass result",
-            status=status, details=self.report["stages"][stage])
+            status=status, details=entry)
         return result
+
+    def _run_pass(self, name, function):
+        if function is project_initialization:
+            return self._run(name, function, self.output_dir, port=self.port, pause=self.pause)
+        if function in (explore_requirement, design_frontend_ui, implement_frontend_ui,
+                design_frontend_triggers, implement_frontend_triggers):
+            return self._run(name, function, self.input_dir, self.arc_dir, pause=self.pause)
+        return self._run(name, function, self.arc_dir, pause=self.pause)
+
+    def _after_initialization(self, multiple):
+        """In multi-stage runs, prepare dependency manifests and install them in the background."""
+        if not multiple or self.report["stages"].get("00_project_initialization", {}).get("status") != "GREEN":
+            return
+        try:
+            # Stage 08's (deterministic) preparation adds frontend dependencies; doing it
+            # now lets the background install cover them instead of a second install later.
+            prepare_frontend(self.output_dir)
+        except (OSError, ValueError) as error:
+            print(f"Frontend preparation deferred to stage 08: {error}", flush=True)
+        try:
+            prefetch_dependencies(self.output_dir)
+        except (OSError, ValueError) as error:
+            print(f"Background npm install not started: {error}", flush=True)
+
+    def _run_concurrently(self, passes):
+        """Start each pass as soon as the passes it needs have finished."""
+        ordered = [name for name, _, _ in passes]
+        entries = {name: (function, artifact) for name, function, artifact in passes}
+        pending, running, done = [name for name, _, _ in passes], set(), set()
+        finished = queue.Queue()
+
+        def work(name):
+            try:
+                finished.put((name, self._run_pass(name, entries[name][0]), None))
+            except BaseException as error:  # Re-raised on the main thread.
+                finished.put((name, None, error))
+
+        while pending or running:
+            for name in list(pending):
+                if stage_needs(name, ordered) <= done:
+                    pending.remove(name)
+                    running.add(name)
+                    if running - {name}:
+                        print(f"Starting {name} alongside: {', '.join(sorted(running - {name}))}", flush=True)
+                    Thread(target=copy_context().run, args=(work, name), name=f"stage-{name}", daemon=True).start()
+            while True:
+                try:
+                    name, result, error = finished.get(timeout=0.5)
+                    break
+                except queue.Empty:
+                    continue
+            running.discard(name)
+            if error is not None:
+                raise error
+            done.add(name)
+            self.artifacts[entries[name][1]] = result
+            if entries[name][0] is project_initialization:
+                self._after_initialization(len(passes) > 1)
 
     def compile(self, stage: str | None = None) -> Path:
         """Execute every pass, or only the selected pass using existing artifacts."""
@@ -98,15 +206,21 @@ class Compiler:
         self.report = {"status": "RUNNING", "stages": {}}
         show_panel("Requirement compiler | Pipeline",
             f"Input: {self.input_dir}\nOutput: {self.output_dir}\nPasses: {len(passes)}\nDetailed model logs: {'enabled' if self.model_log else 'disabled'}")
-        for name, function, artifact in passes:
-            if function is project_initialization:
-                result = self._run(name, function, self.output_dir, port=self.port, pause=self.pause)
-            elif function in (explore_requirement, design_frontend_ui, implement_frontend_ui,
-                    design_frontend_triggers, implement_frontend_triggers):
-                result = self._run(name, function, self.input_dir, self.arc_dir, pause=self.pause)
+        overlap = (len(passes) > 1 and not self.pause
+            and os.getenv("ARC_OVERLAP_STAGES", "1").strip().lower() not in {"0", "false", "no", "off"})
+        try:
+            if overlap:
+                self._run_concurrently(passes)
             else:
-                result = self._run(name, function, self.arc_dir, pause=self.pause)
-            self.artifacts[artifact] = result
+                for name, function, artifact in passes:
+                    self.artifacts[artifact] = self._run_pass(name, function)
+                    if function is project_initialization:
+                        # Overlap the slow first npm install with the model-only design
+                        # stages; stage 04 joins it before touching node_modules.
+                        self._after_initialization(len(passes) > 1)
+        finally:
+            # After an interrupt, running stages are daemon threads and must not block exit.
+            cancel_prefetches()
         self.current_stage = None
         incomplete = [name for name, result in self.report["stages"].items()
             if result["status"] in {"FAILED", "COMPLETED_WITH_FAILURES"}]

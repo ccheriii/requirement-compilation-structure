@@ -263,7 +263,11 @@ class ConsoleLogging(unittest.TestCase):
                 invoke(model.client, arguments)
             records = [json.loads(line) for line in (root / "model_calls.jsonl").read_text().splitlines()]
         self.assertNotIn("QUJD", terminal.getvalue())
-        self.assertEqual(json.loads(records[1]["body"]), arguments)
+        body = json.loads(records[1]["body"])
+        # Requests are streamed for stall detection; the logged body is the real wire body.
+        body.pop("stream", None)
+        body.pop("stream_options", None)
+        self.assertEqual(body, arguments)
 
     def test_disabled_model_logging_keeps_usage_without_dumping_prompts_or_responses(self):
         marker = "PRIVATE-MODEL-OUTPUT"

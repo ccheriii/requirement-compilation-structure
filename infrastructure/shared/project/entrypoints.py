@@ -3,6 +3,7 @@
 import posixpath
 from pathlib import Path, PurePosixPath
 import json
+from threading import RLock
 
 from infrastructure.utils.paths import check_path_case
 from infrastructure.utils.files import save_json
@@ -19,12 +20,18 @@ def selected_path(output: Path, kind: str, identity: str) -> str | None:
     return paths.get(kind, {}).get(identity)
 
 
+# Concurrent agents (parallel test generation) may bind targets at the same time;
+# the index update is read-modify-write.
+_INDEX_LOCK = RLock()
+
+
 def remember_path(output: Path, kind: str, identity: str, relative: str) -> None:
     """Persist the implementation path for a target without model response metadata."""
-    index = output / ".arc/implementation_paths.json"
-    paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
-    paths.setdefault(kind, {})[identity] = relative
-    save_json(index, paths)
+    with _INDEX_LOCK:
+        index = output / ".arc/implementation_paths.json"
+        paths = json.loads(index.read_text(encoding="utf-8-sig")) if index.is_file() else {}
+        paths.setdefault(kind, {})[identity] = relative
+        save_json(index, paths)
 
 
 def implementation_entrypoint(output: Path, kind: str, identity: str) -> dict | None:

@@ -7,7 +7,7 @@ from infrastructure.shared.agent.feedback import CheckFailure, compact_feedback
 from infrastructure.shared.agent.tools import FileTools
 from infrastructure.shared.agent.loop import run_file_agent
 from infrastructure.shared.models.text import TextModel
-from infrastructure.shared.project.dependencies import install_dependencies
+from infrastructure.shared.project.dependencies import EnvironmentFailure, install_dependencies
 from infrastructure.shared.project.git import checkpoint
 from infrastructure.stages.database.order import table_dependencies, implementation_groups
 from infrastructure.stages.database.testing import DatabaseChecks
@@ -194,6 +194,8 @@ def verify_database_runtime(arc_dir, schema, model, console, max_turns=10):
     try:
         gate()
         return report
+    except EnvironmentFailure:
+        raise
     except (ValueError, RuntimeError) as error:
         feedback = getattr(error, "feedback", {"error": str(error)})
 

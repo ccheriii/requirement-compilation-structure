@@ -1,6 +1,9 @@
 """Step 01: read the requirement tree, display every field, and analyze images."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
+import os
 import re
 from pathlib import Path
 
@@ -292,13 +295,20 @@ def explore_requirement(input_dir: Path, arc_dir: Path, pause: bool = False) -> 
     analysis = {}
     if references:
         model = VisualModel()
-        for reference in references:
-            print(f"Analyzing image: {reference}", flush=True)
-            analysis[reference] = model.analyze(input_dir / reference)
-            save_json(arc_dir / "visual_analysis.json", analysis)
-            checkpoint(arc_dir.parent, stage="01", task=reference, action="Publish visual reference analysis",
-                details={"reference": reference, "analysis": analysis[reference]})
-            console.show(f"3. Visual analysis | {reference}", json.dumps(analysis[reference], ensure_ascii=False, indent=2))
+        # Images are independent: request them concurrently (each in a copy of the
+        # logging context), then publish results sequentially in input order.
+        workers = max(1, min(len(references), int(os.getenv("VISUAL_CONCURRENCY", "4") or 1)))
+        print(f"Analyzing {len(references)} image(s) with up to {workers} concurrent request(s): "
+            + ", ".join(references), flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = {reference: pool.submit(copy_context().run, model.analyze, input_dir / reference)
+                for reference in references}
+            for reference in references:
+                analysis[reference] = pending[reference].result()
+                save_json(arc_dir / "visual_analysis.json", analysis)
+                checkpoint(arc_dir.parent, stage="01", task=reference, action="Publish visual reference analysis",
+                    details={"reference": reference, "analysis": analysis[reference]})
+                console.show(f"3. Visual analysis | {reference}", json.dumps(analysis[reference], ensure_ascii=False, indent=2))
     else:
         console.show("3. Visual analysis", "No referenced images; no model call is needed.")
     save_json(arc_dir / "visual_analysis.json", analysis)

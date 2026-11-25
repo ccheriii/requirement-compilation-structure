@@ -1,5 +1,16 @@
 """Shared model instructions for the executable file-tool registry."""
 
+# Appended to every generated-test prompt. Startup data is the union of ALL
+# requirements' prerequisite records, so a test that asserts an absolute state
+# (empty table, exact row count) conflicts with other requirements and can never
+# be repaired by the implementation without breaking them.
+TEST_DATA_RULES = '''TEST DATA ASSERTIONS: the test database starts with startup data required by ALL
+requirements, including records unrelated to this one. Never assert that a table is empty,
+an exact total row count, or that only certain records exist in the starting state. Snapshot
+the relevant records inside the test before the When action and assert the change (or the
+absence of change) afterwards, scoped to the records the scenario identifies (for example by
+a unique key the test chose). Use unique values for records the test creates.'''
+
 FILE_TOOL_RULES = '''Use the file tools declared in input.tools. Return one JSON object with tool_calls.
 Each call is FLAT: tool, path and all other parameters are sibling fields.
 Do not nest parameters inside arguments, parameters or function.
@@ -24,6 +35,10 @@ Append to an existing file:
 {"tool_calls":[{"tool":"edit_file","path":"backend/src/example.ts",
 "operation":"append","new_content":"\\n// Additional implementation\\n"}]}.
 Use read_file calls when evidence is missing, and edit_file calls when ready to change code.
+BATCH READS: every read round resends this entire context. Decide everything you need and
+request ALL of it in ONE tool_calls list (several read_file calls), not one file per round:
+{"tool_calls":[{"tool":"read_file","path":"a.ts"},{"tool":"read_file","path":"b.ts"}]}.
+Check input.files and input.read_files first; they often already contain what you need.
 The compiler executes calls and returns tool_results; tools are not prose instructions.
 Do not return legacy edits/content proposals, shell commands, Markdown or OS-specific paths.
 
@@ -55,7 +70,9 @@ edit_file is the only source-writing tool:
 - replace: old_content is nonempty and occurs exactly once. Copy it exactly from supplied
   content or read_file, including whitespace/newlines. new_content replaces that span;
   empty new_content deletes that local span only when correcting the relevant behavior.
-  Whole-file replacement is forbidden. Expand matching context only to make it unique.
+  Whole-file replacement is rejected if it removes or changes any existing line; a full
+  replacement is accepted only when it keeps every existing line in order (additions only).
+  Prefer a small unique span. Expand matching context only to make it unique.
 - prepend/append: insert new_content at an existing file boundary, preserving everything else.
 For create/prepend/append, omit old_content or use an empty string. Include needed newlines.
 A fragment read is sufficient for a unique replacement; no full-file read is required.

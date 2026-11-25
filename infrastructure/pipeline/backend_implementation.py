@@ -1,12 +1,16 @@
 """Step 06: implement backend APIs against real-server HTTP acceptance suites."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
+import os
 from pathlib import Path
 
 from infrastructure.shared.agent.context import SourceFiles
 from infrastructure.shared.agent.discovery import project_index
 from infrastructure.shared.project.entrypoints import selected_path
 from infrastructure.shared.agent.loop import run_file_agent
+from infrastructure.shared.agent.tools.protocol import TEST_DATA_RULES
 from infrastructure.shared.agent.recovery import implementation_task, final_checks, complete_report
 from infrastructure.stages.backend.context import load_context, requirement_context, api_requirement_uses, supplied_sources, related_schema
 from infrastructure.utils.files import read_artifact
@@ -79,7 +83,7 @@ may already be GREEN; no stub replaces it. Backend startup failures are implemen
 feedback, not proof the test is wrong. During generation repair test syntax/fixtures and
 existing compilation problems, not the new operation. Generated tests remain correctable
 against requirement evidence; preserve valid success/rejection coverage and previous tests.
-"""
+""" + "\n\n" + TEST_DATA_RULES
 
 IMPLEMENT_INSTRUCTIONS = """Implement task.api according to its canonical contract against its generated tests.
 Use edit_file to create task.file_target under backend/src or repair implementation_path. Export:
@@ -162,6 +166,60 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
     report = {"status": "RUNNING", "requirements": {}, "tests": {}, "red": {}, "green": {}, "agents": {}}
     # Publish a current status before work; an old GREEN is never reused as proof.
     save_json(arc_dir / "backend_tdd.json", report)
+    def test_context(aid, rid, relative):
+        return {
+            "api_id": aid, "api": contracts["apis"][aid],
+            "requirement": requirement_context(tree, rid),
+            "db_schema": related_schema(schema, [contracts["apis"][aid]]),
+            "test_path": relative if (output / relative).is_file() else None,
+            "max_tests": max_tests,
+            "support_module": TEST_SUPPORT_PATH,
+        }
+
+    # Contract tests are written from the API contract and requirement only, so all
+    # missing suites are written concurrently first. That gate only typechecks; the
+    # TDD loop below still runs each suite (confirming RED) before implementing it,
+    # one API at a time, and asks the model again only if a suite fails to compile.
+    pregenerated = {}
+    first_owner = {}
+    for rid in tree.leaves:
+        for aid in contracts["requirements"].get(rid, []):
+            if aid in owners:
+                first_owner.setdefault(aid, rid)
+    missing = [aid for aid in first_owner if not (output / targets[aid]).is_file()]
+    workers = 1 if pause else max(1, int(os.getenv("ARC_BACKEND_TEST_CONCURRENCY", "4") or 1))
+    if workers > 1 and len(missing) > 1:
+        print(f"Writing {len(missing)} API contract suite(s) with up to {min(workers, len(missing))} concurrent agent(s).", flush=True)
+
+        def write_suite(aid):
+            rid, relative = first_owner[aid], targets[aid]
+            sources = SourceFiles(output, root="backend/src", tests_root="backend/tests")  # One per worker.
+            workspace = sources.workspace(target=("backend_test", aid), existing=relative,
+                references=[*supplied_sources(output, contracts["apis"][aid], schema)])
+
+            def typecheck_gate():
+                chosen = selected_path(output, "backend_test", aid) or relative
+                compiled = checks.typecheck([chosen])
+                if compiled["returncode"]:
+                    raise ValueError(f"Test TypeScript compilation failed: {compiled['output']}")
+                return {"typecheck": compiled}
+
+            return run_file_agent(model, TEST_INSTRUCTIONS, test_context(aid, rid, relative), workspace,
+                typecheck_gate, max_turns, console, f"{rid} / {aid} / Test Generation (parallel)",
+                feedback_filter=lambda value: sources.feedback(workspace, value), context_index=context_index,
+                reasoning="tests")
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(missing))) as pool:
+            futures = {aid: pool.submit(copy_context().run, write_suite, aid) for aid in missing}
+            for aid, future in futures.items():
+                try:
+                    pregenerated[aid] = future.result()["turns"]
+                except (ValueError, RuntimeError) as error:
+                    console.show(f"{aid} / Test Generation (parallel) | deferred", str(error))
+                chosen = selected_path(output, "backend_test", aid)
+                if chosen:
+                    targets[aid] = chosen
+
     try:
         files_by_api = {aid: [relative] for aid, relative in targets.items()}
         accepted, attempted = [], set()
@@ -183,7 +241,8 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
             for aid in pending:
                 attempted.add(aid)
                 entry = report.setdefault("apis", {}).setdefault(aid, {"status": "GENERATING_TESTS", "api": aid})
-                with implementation_task(output, entry, console, "08 / " + aid):
+                with implementation_task(output, entry, console, "08 / " + aid,
+                        roots=("backend/src", "backend/tests"), index_kinds=("api", "backend_test")):
                     api_owners = owners[aid]
                     api = contracts["apis"][aid]
                     relative = targets[aid]
@@ -211,18 +270,22 @@ def implement_backend_tdd(arc_dir: Path, pause: bool = False, max_turns: int = 1
                             status=status, details={"test_path": chosen, "checks": result})
                         return {"typecheck": compiled, "tests": result, "status": status}
 
-                    context = {
-                        "api_id": aid, "api": api,
-                        "requirement": requirement_context(tree, rid),
-                        "db_schema": related_schema(schema, [api]), "test_path": relative if (output / relative).is_file() else None,
-                        "max_tests": max_tests,
-                        "support_module": TEST_SUPPORT_PATH,
-                    }
+                    context = test_context(aid, rid, relative)
                     workspace = selection.workspace(target=("backend_test", aid), existing=relative,
                         references=[*supplied_sources(output, api, schema)])
-                    agent = run_file_agent(model, TEST_INSTRUCTIONS, context, workspace,
-                        test_gate, max_turns, console, label + " / Test Generation",
-                        feedback_filter=lambda value: selection.feedback(workspace, value), context_index=context_index)
+                    agent, generation_feedback = None, None
+                    if aid in pregenerated and (output / relative).is_file():
+                        # Written in parallel above: run it now (in order) instead of
+                        # asking the model again; regenerate only if the gate rejects it.
+                        try:
+                            agent = {"turns": pregenerated[aid], "checks": test_gate()}
+                        except (ValueError, RuntimeError) as error:
+                            generation_feedback = getattr(error, "feedback", {"error": str(error)})
+                    if agent is None:
+                        agent = run_file_agent(model, TEST_INSTRUCTIONS, context, workspace,
+                            test_gate, max_turns, console, label + " / Test Generation", feedback=generation_feedback,
+                            feedback_filter=lambda value: selection.feedback(workspace, value), context_index=context_index,
+                            reasoning="tests")
                     for owner in api_owners:
                         report["tests"].setdefault(owner, {})[aid] = targets[aid]
                     report["agents"][f"tests:{aid}"] = {"turns": agent["turns"]}

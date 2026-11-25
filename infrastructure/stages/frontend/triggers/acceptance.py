@@ -1,10 +1,14 @@
 """Independent requirement acceptance, separate from implementation-owned tests."""
 
+from contextvars import copy_context
+from threading import Event, Semaphore, Thread
 from hashlib import sha256
+import os
 import yaml
 
 from infrastructure.shared.agent.tools import FileTools
-from infrastructure.shared.agent.loop import run_file_agent
+from infrastructure.shared.agent.loop import repeated_test_blame, run_file_agent
+from infrastructure.shared.agent.tools.protocol import TEST_DATA_RULES
 from infrastructure.shared.agent.conventions import task_conventions
 from infrastructure.shared.agent.context import SourceFiles
 from infrastructure.shared.agent.discovery import project_index
@@ -17,6 +21,7 @@ from infrastructure.stages.frontend.triggers.implementation import scenario_cont
 from infrastructure.stages.frontend.triggers.e2e_runtime import FIXTURE
 from infrastructure.stages.frontend.triggers.testing import E2EChecks, test_path
 from infrastructure.stages.frontend.triggers.scope import TriggerCheckFailure
+from infrastructure.shared.agent.feedback import failure_message
 from infrastructure.stages.frontend.triggers.design import api_ids
 from infrastructure.stages.frontend.ui.runtime import APPLICATION_ENTRYPOINTS
 from infrastructure.stages.frontend.ui.testing import FrontendChecks, require_green, test_path as ui_test_path
@@ -63,7 +68,7 @@ If it exists, use only a targeted edit based on its supplied content. Do not use
 for an existing file, or replace/append/prepend for a missing file. Do not write to any
 other path. After creating the suite, use the actual path returned by the tool in later
 calls, then fix TypeScript errors reported by the supplied check without weakening
-requirement assertions.'''
+requirement assertions.''' + "\n\n" + TEST_DATA_RULES
 
 REVIEW_INSTRUCTIONS = '''Review this independent acceptance test against the original requirement.
 This is a separate test review, not implementation repair. Actual failure evidence is
@@ -76,6 +81,27 @@ business failure GREEN. Never adjust expected values just to match observed wron
 Read project files as needed to understand wiring, fixtures and failure evidence. Use
 original requirements as authority for expected business behavior; source code and existing
 tests do not override them. Only test_path is writable; all other files remain read-only.'''
+
+
+ESCALATED_REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS + '''
+
+ESCALATED REVIEW: the implementation repair agent cannot edit this test and repeatedly
+diagnosed the test itself as wrong. feedback.repair_diagnoses holds its reasoning; treat
+it as claims to verify, not as authority. Check each claim against original_requirement,
+the fixture and the startup data. If the test asserts something the original requirement
+does not require (for example an absolute starting state that other requirements' startup
+data legitimately changes), correct only that assertion and keep every required business
+outcome. If the claims are wrong, return tool_calls=[] and explain why.'''
+
+REPAIR_SUFFIX = ('Independent acceptance suites are read-only for implementation repair. '
+    'Preserve their original requirement outcomes and repair the real application. '
+    'Test review has already been performed separately. Failures in supplied final '
+    'regression/build checks are also repair targets: retrieve the failing requirement '
+    'and source evidence on demand, and preserve other accepted behavior.')
+
+# Keys implementation_task() writes on failure; cleared before a retry.
+FAILURE_KEYS = ('task', 'phase', 'error', 'error_type', 'turns', 'feedback', 'diagnoses',
+    'changed_files', 'deleted_files', 'archive')
 
 
 def require_acceptance(result):
@@ -96,10 +122,113 @@ def original_requirements(input_dir):
     return RequirementTree(yaml.safe_load(path.read_text(encoding='utf-8-sig')))
 
 
+class AcceptanceSuites:
+    """Writes the independent acceptance suites; can start early, in the background.
+
+    Suites are written from the original requirements, UI design and API contracts
+    only, and each touches only its own file (typecheck uses a private temporary
+    config). So they can be written concurrently with each other and while stage
+    10 implements requirements; running, review and repair stay sequential.
+    """
+
+    def __init__(self, input_dir, arc_dir, schema, backend, ui, design, model, console, max_turns=10):
+        self.output = arc_dir.parent.resolve()
+        self.tree = original_requirements(input_dir)
+        self.schema, self.backend, self.ui, self.design = schema, backend, ui, design
+        self.model, self.console, self.max_turns = model, console, max_turns
+        self.checks = E2EChecks(self.output)
+        self.generated, self._running = {}, {}
+
+    def prepare(self, rid):
+        """Build one requirement's acceptance task; None when it has no UI to test."""
+        output, checks, path = self.output, self.checks, acceptance_path(rid)
+        context = scenario_context(self.ui, self.design, rid)
+        aids = set(self.backend['requirements'].get(rid, []))
+        for trigger in context['triggers'].values():
+            aids.update(api_ids(trigger))
+        apis = {aid: self.backend['apis'][aid] for aid in aids}
+        task = {'original_requirement': requirement_context(self.tree, rid), 'test_path': path,
+            'ui_interfaces': {pid: {key: page[key] for key in ('route', 'root', 'elements')}
+                for pid, page in context['page_subtrees'].items()},
+            'api_interfaces': {aid: {key: value for key, value in api.items()
+                if key in ('signature', 'request', 'response')} for aid, api in apis.items()},
+            'schema': related_schema(self.schema, apis.values())}
+        if not task['ui_interfaces']:
+            return None
+        task['shared_conventions'] = task_conventions(output, {'requirement': task['original_requirement']})
+        workspace = FileTools.for_target(output, 'acceptance_test', rid, fixed_path=path,
+            references=[FIXTURE, 'backend/tests/support/context.ts'])
+
+        def compile_suite():
+            if not (output / path).is_file():
+                raise ValueError('Create the supplied acceptance test_path')
+            result = checks.typecheck([path], full_source=False)
+            if result['returncode']:
+                raise ValueError(result['output'])
+            return result
+
+        return {'path': path, 'context': context, 'aids': aids, 'apis': apis, 'task': task,
+            'workspace': workspace, 'compile_suite': compile_suite}
+
+    def generate(self, rid, prepared):
+        return run_file_agent(self.model, INSTRUCTIONS, prepared['task'], prepared['workspace'],
+            prepared['compile_suite'], self.max_turns, self.console,
+            'Independent acceptance / ' + rid + ' / Generation', reasoning='tests')
+
+    def start(self):
+        """Begin writing every missing suite concurrently; returns immediately."""
+        workers = int(os.getenv('ARC_ACCEPTANCE_CONCURRENCY', '4') or 1)
+        missing = [rid for rid in self.tree.leaves if not (self.output / acceptance_path(rid)).is_file()
+            and rid not in self._running and rid not in self.generated]
+        if workers <= 1 or len(missing) <= 1 or getattr(self.console, 'pause', False):
+            return self  # The sequential loop writes them, as before.
+        prepared = {}
+        for rid in missing:
+            try:
+                item = self.prepare(rid)
+            except (ValueError, RuntimeError, KeyError):
+                continue  # Reported by the sequential loop.
+            if item is not None:
+                prepared[rid] = item
+        if not prepared:
+            return self
+        print(f'Writing {len(prepared)} independent acceptance suite(s) in the background with up to '
+            f'{min(workers, len(prepared))} concurrent agent(s).', flush=True)
+        slots = Semaphore(min(workers, len(prepared)))
+        for rid, item in prepared.items():
+            holder, done = {}, Event()
+
+            def work(rid=rid, item=item, holder=holder, done=done):
+                try:
+                    with slots:
+                        holder['turns'] = self.generate(rid, item)['turns']
+                except (ValueError, RuntimeError) as error:
+                    holder['error'] = error
+                except BaseException as error:  # Never lose an unexpected failure.
+                    holder['error'] = RuntimeError(f'{type(error).__name__}: {error}')
+                finally:
+                    done.set()
+
+            # Daemon threads: an interrupt never waits for background writers.
+            Thread(target=copy_context().run, args=(work,), name=f'acceptance-{rid}', daemon=True).start()
+            self._running[rid] = (holder, done)
+        return self
+
+    def results(self):
+        """Wait for background writers; {rid: {'turns'} or {'error'}}."""
+        waiting = [rid for rid, (_holder, done) in self._running.items() if not done.is_set()]
+        if waiting:
+            print('Waiting for background acceptance suites: ' + ', '.join(waiting), flush=True)
+        for rid, (holder, done) in list(self._running.items()):
+            done.wait()
+            self.generated[rid] = dict(holder)
+        self._running.clear()
+        return self.generated
+
+
 def run_independent_acceptance(input_dir, arc_dir, schema, backend, ui, design, model, console,
-        max_turns=10, *, process_report):
+        max_turns=10, *, process_report, suites=None):
     output = arc_dir.parent.resolve()
-    tree = original_requirements(input_dir)
     checks = E2EChecks(output)
     ui_checks = FrontendChecks(output)
     backend_checks = BackendChecks(output)
@@ -115,41 +244,29 @@ def run_independent_acceptance(input_dir, arc_dir, schema, backend, ui, design, 
         for check in process_report.get('verification', {}).values())
     report = {'status': 'RUNNING', 'requirements': {}}
     save_json(arc_dir / 'independent_acceptance.json', report)
+
+    suites = suites or AcceptanceSuites(input_dir, arc_dir, schema, backend, ui, design, model, console, max_turns).start()
+    generated = suites.results()
+    prepare, generate, tree = suites.prepare, suites.generate, suites.tree
+
     for rid in tree.leaves:
         path = acceptance_path(rid)
         entry = {'status': 'GENERATING', 'test_path': path}
         report['requirements'][rid] = entry
         label = 'Independent acceptance / ' + rid
         try:
-            context = scenario_context(ui, design, rid)
-            aids = set(backend['requirements'].get(rid, []))
-            for trigger in context['triggers'].values():
-                aids.update(api_ids(trigger))
-            apis = {aid: backend['apis'][aid] for aid in aids}
-            task = {'original_requirement': requirement_context(tree, rid), 'test_path': path,
-                'ui_interfaces': {pid: {key: page[key] for key in ('route', 'root', 'elements')}
-                    for pid, page in context['page_subtrees'].items()},
-                'api_interfaces': {aid: {key: value for key, value in api.items()
-                    if key in ('signature', 'request', 'response')} for aid, api in apis.items()},
-                'schema': related_schema(schema, apis.values())}
-            if not task['ui_interfaces']:
+            prepared = prepare(rid)
+            if prepared is None:
                 entry.update(status='FAILED', error='No UI interface available for independent requirement acceptance; not verified')
                 continue
-            task['shared_conventions'] = task_conventions(output, {'requirement': task['original_requirement']})
-            workspace = FileTools.for_target(output, 'acceptance_test', rid, fixed_path=path,
-                references=[FIXTURE, 'backend/tests/support/context.ts'])
-
-            def compile_suite():
-                if not (output / path).is_file():
-                    raise ValueError('Create the supplied acceptance test_path')
-                result = checks.typecheck([path], full_source=False)
-                if result['returncode']:
-                    raise ValueError(result['output'])
-                return result
-
-            if not (output / path).is_file():
-                agent = run_file_agent(model, INSTRUCTIONS, task, workspace, compile_suite,
-                    max_turns, console, label + ' / Generation')
+            context, aids, apis = prepared['context'], prepared['aids'], prepared['apis']
+            task, workspace, compile_suite = prepared['task'], prepared['workspace'], prepared['compile_suite']
+            if rid in generated:
+                if 'error' in generated[rid]:
+                    raise generated[rid]['error']
+                entry['generation_turns'] = generated[rid]['turns']
+            elif not (output / path).is_file():
+                agent = generate(rid, prepared)
                 entry['generation_turns'] = agent['turns']
             result = checks.tests([path])
             entry["result"] = result
@@ -217,31 +334,52 @@ def run_independent_acceptance(input_dir, arc_dir, schema, backend, ui, design, 
                         if evidence['build']['returncode']:
                             raise ValueError(evidence['build']['output'])
                     except (ValueError, RuntimeError) as error:
-                        raise TriggerCheckFailure(str(error), evidence) from error
+                        raise TriggerCheckFailure(failure_message(error), evidence) from error
                     return evidence
 
                 def repair_feedback(value):
                     return selection.feedback(repair_workspace, backend_selection.feedback(repair_workspace, value))
 
-                with implementation_task(output, entry, console, label + ' / Repair'):
-                    repair = run_file_agent(model, IMPLEMENT_INSTRUCTIONS + '\n\n'
-                        'Independent acceptance suites are read-only for implementation repair. '
-                        'Preserve their original requirement outcomes and repair the real application. '
-                        'Test review has already been performed separately. Failures in supplied final '
-                        'regression/build checks are also repair targets: retrieve the failing requirement '
-                        'and source evidence on demand, and preserve other accepted behavior.',
-                        repair_task, repair_workspace, repair_gate, max_turns, console,
-                        label + ' / Repair', feedback={'acceptance': result,
-                            'verification': process_report.get('verification', {}) if pending_verification else {}},
-                        feedback_filter=repair_feedback,
-                        context_index=context_index)
-                    entry.update(status='GREEN', repair_turns=repair['turns'],
-                        result=repair['checks']['acceptance'], repair_checks=repair['checks'])
+                def run_repair(acceptance_result, stop_when=None):
+                    entry['status'] = 'REPAIRING'
+                    with implementation_task(output, entry, console, label + ' / Repair'):
+                        repair = run_file_agent(model, IMPLEMENT_INSTRUCTIONS + '\n\n' + REPAIR_SUFFIX,
+                            repair_task, repair_workspace, repair_gate, max_turns, console,
+                            label + ' / Repair', feedback={'acceptance': acceptance_result,
+                                'verification': process_report.get('verification', {}) if pending_verification else {}},
+                            feedback_filter=repair_feedback,
+                            context_index=context_index, stop_when=stop_when)
+                        entry.update(status='GREEN', repair_turns=repair['turns'],
+                            result=repair['checks']['acceptance'], repair_checks=repair['checks'])
+
+                # Stop early if the repair agent keeps blaming the read-only test:
+                # more implementation rounds cannot change it.
+                repaired = True
+                run_repair(result, stop_when=repeated_test_blame())
+                if entry['status'] == 'FAILED' and entry.get('error_type') == 'AgentEscalated':
+                    escalation = {key: entry.pop(key) for key in FAILURE_KEYS if key in entry}
+                    entry['escalation'] = escalation
+                    save_json(arc_dir / 'independent_acceptance.json', report)
+                    # The application baseline was restored; re-observe it, then let the
+                    # test owner verify the repair agent's claims against the requirement.
+                    current = checks.tests([path])
+                    review = run_file_agent(model, ESCALATED_REVIEW_INSTRUCTIONS, task, workspace,
+                        compile_suite, max_turns, console, label + ' / Escalated test review',
+                        feedback={'acceptance': current, 'repair_diagnoses': escalation.get('diagnoses')})
+                    entry['escalated_review_turns'] = review['turns']
+                    result = checks.tests([path])
+                    entry['result'] = result
+                    if test_run_status(result) == 'GREEN' and not pending_verification:
+                        # Only this acceptance suite was re-run; no smoke suites were verified.
+                        entry['status'], repaired = 'GREEN', False
+                    else:
+                        run_repair(result)
                 if entry['status'] == 'FAILED':
                     continue
                 result = entry['result']
-                verified_process.update(key for key in process_ids if test_path(key, output) in process_files)
-                pending_verification = False
+                if repaired:
+                    verified_process.update(key for key in process_ids if test_path(key, output) in process_files)
+                    pending_verification = False
             require_acceptance(result)
             process_entry = process_report['requirements'].get(rid)
             if process_entry and process_entry.get('status') == 'FAILED' and rid in verified_process:

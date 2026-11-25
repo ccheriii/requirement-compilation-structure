@@ -4,7 +4,7 @@ from pathlib import Path
 
 from infrastructure.stages.frontend.triggers.context import load_e2e_context
 from infrastructure.stages.frontend.triggers.implementation import run_trigger_tdd, verify_frontend
-from infrastructure.stages.frontend.triggers.acceptance import run_independent_acceptance
+from infrastructure.stages.frontend.triggers.acceptance import AcceptanceSuites, run_independent_acceptance
 from infrastructure.shared.models.text import TextModel
 from infrastructure.utils.presentation.console import DemoConsole
 from infrastructure.utils.files import save_json
@@ -24,10 +24,14 @@ def implement_frontend_triggers(input_dir: Path, arc_dir: Path, pause: bool = Fa
             save_json(arc_dir / "frontend_e2e.json", report)
             return report
         model = TextModel()
+        # Acceptance suites need only the requirements and designs, so they are
+        # written in the background while requirements are implemented one by one.
+        suites = AcceptanceSuites(input_dir, arc_dir, schema, backend, ui, interactions,
+            model, DemoConsole(pause), max_turns)
         result = run_trigger_tdd(arc_dir, tree, schema, backend, ui, interactions, images,
-            contexts, model, DemoConsole(pause), report, max_turns, max_tests)
+            contexts, model, DemoConsole(pause), report, max_turns, max_tests, on_ready=suites.start)
         acceptance = run_independent_acceptance(input_dir, arc_dir, schema, backend, ui, interactions,
-            model, DemoConsole(pause), max_turns, process_report=result)
+            model, DemoConsole(pause), max_turns, process_report=result, suites=suites)
         if any(entry.get("repair_checks") for entry in acceptance["requirements"].values()):
             result = verify_frontend(arc_dir, tree, backend, ui, DemoConsole(pause), result)
         result["verification"]["independent_acceptance"] = {"status": "GREEN" if acceptance["status"] == "GREEN" else "FAILED",

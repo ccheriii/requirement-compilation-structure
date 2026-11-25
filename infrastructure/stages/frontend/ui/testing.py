@@ -214,3 +214,8 @@ class FrontendChecks:
         """Run the generated workspace's frontend and backend build command and return the captured result."""
         command = npm_command()
         return self.execute([*command[1:], "run", "build"], executable=command[0])
+
+    def build_frontend(self) -> dict:
+        """Build only the frontend workspace (stage 08 may run beside backend work)."""
+        command = npm_command()
+        return self.execute([*command[1:], "run", "build", "--workspace", "@arc/frontend"], executable=command[0])

@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 
+from infrastructure.shared.project.dependencies import EnvironmentFailure
+
 
 class StageIncomplete(RuntimeError):
     def __init__(self, stage, failures):
@@ -22,7 +24,7 @@ class TaskFailures:
         try:
             yield
         except Exception as error:
-            if isinstance(error, OSError):
+            if isinstance(error, (OSError, EnvironmentFailure)):
                 raise
             self.report['tasks'][identity] = {'status': 'FAILED', 'error': str(error),
                 'error_type': type(error).__name__}

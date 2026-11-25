@@ -4,10 +4,14 @@ For each leaf requirement, one agent generates key E2E cases and another repairs
 the trigger implementation. Complete that requirement before advancing; include
 accepted functional smoke scenarios in regression checks."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import json
+import os
 
 from infrastructure.shared.agent.files import editable_application_path
 from infrastructure.shared.agent.loop import run_file_agent
+from infrastructure.shared.agent.tools.protocol import TEST_DATA_RULES
 from infrastructure.shared.agent.recovery import implementation_task, final_checks, complete_report
 from infrastructure.shared.agent.context import SourceFiles
 from infrastructure.shared.agent.discovery import project_index
@@ -20,6 +24,7 @@ from infrastructure.stages.backend.context import related_schema
 from infrastructure.stages.backend.testing import BackendChecks, require_green as require_backend_green
 from infrastructure.stages.frontend.triggers.design import api_ids, trigger_obligations
 from infrastructure.stages.frontend.triggers.scope import TriggerCheckFailure, model_context
+from infrastructure.shared.agent.feedback import failure_message
 from infrastructure.shared.project.dependencies import install_dependencies
 from infrastructure.utils.files import save_json
 from infrastructure.stages.frontend.ui.design import page_context, page_elements
@@ -112,7 +117,7 @@ test generation, fix test syntax, fixtures or invalid selectors. Missing applica
 behavior is valid RED; retain that case for implementation. Runtime failures in supplied
 application sources are implementation feedback, not a reason to rewrite the expected
 business result. Compilation and a real browser run check the suite before code repair.
-"""
+""" + "\n\n" + TEST_DATA_RULES
 
 IMPLEMENT_INSTRUCTIONS = """Implement the current requirement's interactions in the actual application.
 Step 09's triggers are a reference prototype: preserve their requirement-defined behavior,
@@ -204,8 +209,11 @@ If a necessary correction is outside tool scope, explain the exact blocker in di
 """
 
 
+ACCEPTANCE_DIR = "frontend/tests/e2e/acceptance"
+
+
 def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts,
-        model, console, report, max_turns=10, max_tests=2):
+        model, console, report, max_turns=10, max_tests=2, on_ready=None):
     """Implement design one requirement at a time through real-app E2E TDD.
 
     Prepare dependencies/runtime, generate initial key scenario tests, then
@@ -243,11 +251,12 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                 evidence["ui"] = ui_checks.tests(baseline_files)
                 require_green(evidence["ui"])
         except (ValueError, RuntimeError) as error:
-            raise TriggerCheckFailure("Application baseline failed: " + str(error), evidence) from error
+            raise TriggerCheckFailure("Application baseline failed: " + failure_message(error), evidence) from error
         return evidence
 
     report["baseline"] = {"status": "CHECKING"}
-    with implementation_task(output, report["baseline"], console, "12 / baseline"):
+    # Acceptance suites may be written concurrently; a rollback must not delete them.
+    with implementation_task(output, report["baseline"], console, "12 / baseline", exclude=(ACCEPTANCE_DIR,)):
         try:
             baseline = baseline_gate()
         except (ValueError, RuntimeError) as error:
@@ -274,12 +283,84 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
             report["baseline"]["repair_turns"] = repair["turns"]
         report["baseline"].update(status="GREEN", checks=baseline)
     save_json(arc_dir / "frontend_e2e.json", report)
+
+    def requirement_scenario(rid):
+        """Scenario context, pages, triggers and called APIs for one requirement."""
+        context = scenario_context(ui, design, rid)
+        called = {aid for trigger in context["triggers"].values() for aid in api_ids(trigger)}
+        context["obligations"] = {tid: trigger_obligations(trigger, backend) for tid, trigger in context["triggers"].items()}
+        context.update({"requirement": contexts[rid],
+            "target_trigger_ids": sorted(set(design["requirements"][rid])),
+            "backend_apis": {aid: backend["apis"][aid] for aid in sorted(called)}})
+        return context, context["page_subtrees"], called
+
+    def test_setup(rid, context, pages, called, sources, backend_sources):
+        """Model input and workspace for writing one requirement's smoke suite."""
+        relative = test_path(rid, output)
+        test_context = {**model_context(context), "schema": related_schema(schema, context["backend_apis"].values()),
+            "test_path": relative if (output / relative).is_file() else None, "max_tests": max_tests}
+        test_workspace = sources.workspace(target=("e2e_test", rid), existing=relative,
+            references=["frontend/src/ui-runtime.ts", CONFIG, FIXTURE, "backend/tests/support/context.ts",
+                *sources.paths("page", pages), *APPLICATION_ENTRYPOINTS,
+                "frontend/package.json", "frontend/tsconfig.json",
+                *backend_sources.paths("api", called),
+                *[f"backend/src/db/tables/{name}.sql" for name in related_schema(schema, context["backend_apis"].values())]])
+        return test_context, test_workspace
+
+    # Smoke suites are written from the requirement, UI design and API contracts, so
+    # they can be written for every requirement up front, concurrently. The gate
+    # only typechecks (no concurrent browser runs). The sequential loop below then
+    # finds each suite, runs it, and regenerates it if it no longer compiles.
+    pregenerated = {}
+    workers = int(os.getenv("ARC_E2E_TEST_CONCURRENCY", "4") or 1)
+    pending = [rid for rid in tree.leaves if not (output / test_path(rid, output)).is_file()]
+    if workers > 1 and len(pending) > 1 and not getattr(console, "pause", False):
+        jobs = {}
+        for rid in pending:
+            context, pages, called = requirement_scenario(rid)
+            if not pages and not design["requirements"][rid]:
+                continue
+            # Feedback filtering mutates SourceFiles state: one instance per worker.
+            sources = SourceFiles(output, ui)
+            backend_sources = SourceFiles(output, root="backend/src", tests_root="backend/tests")
+            test_context, test_workspace = test_setup(rid, context, pages, called, sources, backend_sources)
+
+            def typecheck_gate(rid=rid):
+                compiled = checks.typecheck([test_path(rid, output)], full_source=False)
+                if compiled["returncode"]:
+                    raise ValueError(compiled["output"])
+                return {"typecheck": compiled}
+
+            jobs[rid] = (test_context, test_workspace, typecheck_gate,
+                lambda value, workspace=test_workspace, sources=sources: sources.feedback(workspace, value))
+        print(f"Writing {len(jobs)} functional smoke suite(s) with up to {min(workers, len(jobs))} concurrent agent(s).", flush=True)
+
+        def write_suite(rid, job):
+            test_context, test_workspace, gate, feedback_filter = job
+            return run_file_agent(model, TEST_INSTRUCTIONS, test_context, test_workspace, gate, max_turns, console,
+                f"E2E {rid} / Test Generation (parallel)", feedback_filter=feedback_filter, context_index=context_index,
+                reasoning="tests")
+
+        if jobs:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as pool:
+                futures = {rid: pool.submit(copy_context().run, write_suite, rid, job) for rid, job in jobs.items()}
+                for rid, future in futures.items():
+                    try:
+                        pregenerated[rid] = future.result()["turns"]
+                    except (ValueError, RuntimeError) as error:
+                        # The sequential loop writes (or repairs) this suite as before.
+                        console.show(f"E2E {rid} / Test Generation (parallel) | deferred", str(error))
+
+    if on_ready is not None:
+        # Runtime, fixtures and smoke suites exist: independent work (acceptance
+        # suites) may start now and overlap with the sequential loop below.
+        on_ready()
+
     for number, rid in enumerate(tree.leaves, 1):
         tids = set(design["requirements"][rid])
         steps = tree.own_steps[rid]
         label = f"E2E requirement {number}/{len(tree.leaves)} {rid}"
-        context = scenario_context(ui, design, rid)
-        pages = context["page_subtrees"]
+        context, pages, called = requirement_scenario(rid)
         if not pages and not tids:
             report["requirements"][rid] = {"status": "NO_TRIGGERS", "triggers": []}
             save_json(arc_dir / "frontend_e2e.json", report)
@@ -287,16 +368,11 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
         targets = tids
         relative = test_path(rid, output)
         ui_files = [ui_test_path(pid) for pid in pages if (output / ui_test_path(pid)).is_file()]
-        called = {aid for trigger in context["triggers"].values() for aid in api_ids(trigger)}
-        context["obligations"] = {tid: trigger_obligations(trigger, backend) for tid, trigger in context["triggers"].items()}
-        context.update({"requirement": contexts[rid],
-            "target_trigger_ids": sorted(targets),
-            "backend_apis": {aid: backend["apis"][aid] for aid in sorted(called)}})
         console.show(label + " | Scenario context", json.dumps(context, ensure_ascii=False, indent=2))
         report["requirements"][rid] = {"status": "GENERATING_TESTS", "triggers": sorted(tids),
             "target_triggers": sorted(targets), "test_path": relative}
         save_json(arc_dir / "frontend_e2e.json", report)
-        with implementation_task(output, report["requirements"][rid], console, "12 / " + rid):
+        with implementation_task(output, report["requirements"][rid], console, "12 / " + rid, exclude=(ACCEPTANCE_DIR,)):
             regression_files = [test_path(key, output) for key in [*accepted, rid]]
 
             def generation_checks():
@@ -317,14 +393,7 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                     behavior = {"returncode": 1, "output": str(error), "errors": [str(error)]}
                 return {"typecheck": compiled, "behavior": behavior, "status": test_run_status(behavior)}
 
-            test_context = {**model_context(context), "schema": related_schema(schema, context["backend_apis"].values()), "test_path": relative if (output / relative).is_file() else None,
-                "max_tests": max_tests}
-            test_workspace = selection.workspace(target=("e2e_test", rid), existing=relative,
-                references=["frontend/src/ui-runtime.ts", CONFIG, FIXTURE, "backend/tests/support/context.ts",
-                    *selection.paths("page", pages), *APPLICATION_ENTRYPOINTS,
-                    "frontend/package.json", "frontend/tsconfig.json",
-                    *backend_selection.paths("api", called),
-                    *[f"backend/src/db/tables/{name}.sql" for name in related_schema(schema, context["backend_apis"].values())]])
+            test_context, test_workspace = test_setup(rid, context, pages, called, selection, backend_selection)
             agent, generation_feedback = None, None
             if (output / relative).is_file():
                 try:
@@ -335,8 +404,9 @@ def run_trigger_tdd(arc_dir, tree, schema, backend, ui, design, images, contexts
                 agent = run_file_agent(model, TEST_INSTRUCTIONS, test_context,
                     test_workspace, test_gate, max_turns, console, label + " / Test Generation",
                     feedback=generation_feedback,
-                    feedback_filter=lambda value: selection.feedback(test_workspace, value), context_index=context_index)
-            report["requirements"][rid]["test_turns"] = agent["turns"]
+                    feedback_filter=lambda value: selection.feedback(test_workspace, value), context_index=context_index,
+                    reasoning="tests")
+            report["requirements"][rid]["test_turns"] = agent["turns"] + pregenerated.get(rid, 0)
             report["requirements"][rid]["test_path"] = relative
 
             workspace = None

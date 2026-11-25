@@ -2,11 +2,16 @@
 
 from datetime import datetime, timezone
 import json
+import os
 import re
+from threading import Event, Lock, Thread
 import traceback
+import time
 from time import monotonic
+from types import SimpleNamespace
 from uuid import uuid4
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+import socket
 
 import httpx
 
@@ -70,6 +75,7 @@ def _http_request(request: httpx.Request) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         prefix = directory / f"{stage.replace(' ', '_')}.{task}.{call['id'][:8]}.{call['attempt']}"
         request.extensions["compiler_model_log_prefix"] = prefix
+        call["log_prefix"] = prefix  # Streamed outputs are written by invoke().
         messages = json.loads(request.content).get("messages", [])
         text = "\n\n".join(_message_text(message) for message in messages)
         prefix.with_name(prefix.name + ".model.input").write_text(text, encoding="utf-8", newline="\n")
@@ -79,6 +85,12 @@ def _http_request(request: httpx.Request) -> None:
 
 def _http_response(response: httpx.Response) -> None:
     """Read and retain the complete non-streaming response before SDK parsing."""
+    if response.headers.get("content-type", "").startswith("text/event-stream"):
+        # Reading here would block until the whole stream ends and defeat stall
+        # detection; invoke() records the assembled streamed response instead.
+        _record("http_response", status_code=response.status_code,
+            request_id=response.headers.get("x-request-id"), body="(streamed; see response event)")
+        return
     response.read()
     prefix = response.request.extensions.get("compiler_model_log_prefix")
     if prefix is not None:
@@ -268,6 +280,244 @@ def show_call_totals():
     show_panel("Stage model usage | reported counts only", view, tone="output")
 
 
+# --- Stall detection ---------------------------------------------------------
+# Providers sometimes leave a request queued for minutes before generating
+# (observed: 890 tokens in 106 s, while the identical retry took 5 s). Responses
+# are streamed so a request that has produced nothing by a deadline can be
+# cancelled and resent. A healthy long generation keeps streaming and is never
+# interrupted. The last attempt waits without a deadline. ARC_STREAM=0 restores
+# plain non-streaming requests.
+def _env_seconds(name, default):
+    try:
+        return max(0.0, float(os.getenv(name, default)))
+    except ValueError:
+        return float(default)
+
+
+def _abort_stream(stream):
+    """Shut the connection down so a blocked reader wakes and the provider stops work."""
+    try:
+        network = stream.response.extensions.get("network_stream")
+        sock = network.get_extra_info("socket") if network is not None else None
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+class ModelStalled(RuntimeError):
+    """No streamed output arrived before the stall deadline."""
+
+
+def _stream_enabled(client):
+    return (os.getenv("ARC_STREAM", "1").strip().lower() not in {"0", "false", "no", "off"}
+        and not getattr(client, "_arc_stream_unsupported", False))
+
+
+def _stream_rejected(error):
+    message = str(error).lower()
+    return getattr(error, "status_code", None) in {400, 404, 415, 422} and "stream" in message
+
+
+def _stream_completion(client, arguments, first_deadline, idle_deadline):
+    """Stream one completion; abandon it if no output arrives within the deadlines.
+
+    first_deadline covers everything until the first chunk, including waiting for
+    response headers (a queued request sends none). idle_deadline limits silence
+    after output has started. Both are enforced by this thread; the socket read
+    timeout is only the mid-answer limit, so a healthy answer that pauses briefly
+    is never cut off.
+    """
+    from openai import APITimeoutError
+    from openai.types.chat import ChatCompletion
+    options = dict(arguments, stream=True)
+    if not getattr(client, "_arc_no_stream_usage", False):
+        options["stream_options"] = {"include_usage": True}
+    requested = monotonic()
+    api = client
+    if first_deadline:
+        # SDK retries are off for deadline attempts (_complete() resends stalls and
+        # retries transient errors itself).
+        api = client.with_options(max_retries=0, timeout=httpx.Timeout(
+            connect=10.0, read=max(idle_deadline or 0.0, first_deadline), write=60.0, pool=10.0))
+    state = {"last": requested, "started": False, "stream": None, "abandoned": False}
+    guard, finished, outcome = Lock(), Event(), {}
+    content, reasoning, refusal = [], [], []
+    meta = {"finish": None, "usage": None, "model": None, "id": None}
+
+    def consume():
+        try:
+            stream = api.chat.completions.create(**options)
+            with guard:
+                state["stream"] = stream
+                abandoned = state["abandoned"]
+            if abandoned:  # The caller gave up while this request waited for headers.
+                _abort_stream(stream)
+                return
+            http_response = getattr(stream, "response", None)
+            if http_response is not None and not http_response.headers.get("content-type", "").startswith("text/event-stream"):
+                # The provider ignored stream=true and sent an ordinary completion.
+                try:
+                    body = http_response.read()
+                finally:
+                    stream.close()
+                outcome["completion"] = ChatCompletion.model_validate(json.loads(body))
+                return
+            for chunk in stream:
+                if not state["started"]:
+                    state["first_chunk"] = monotonic() - requested
+                state["last"], state["started"] = monotonic(), True
+                meta["model"], meta["id"] = chunk.model or meta["model"], chunk.id or meta["id"]
+                if chunk.usage is not None:
+                    meta["usage"] = chunk.usage.model_dump(mode="json")
+                for choice in chunk.choices:
+                    delta = choice.delta
+                    if delta is not None:
+                        if delta.content:
+                            content.append(delta.content)
+                        if delta.refusal:
+                            refusal.append(delta.refusal)
+                        extra = getattr(delta, "model_extra", None) or {}
+                        piece = extra.get("reasoning_content") or extra.get("reasoning")
+                        if isinstance(piece, str):
+                            reasoning.append(piece)
+                    if choice.finish_reason:
+                        meta["finish"] = choice.finish_reason
+        except BaseException as error:
+            outcome["error"] = error
+        finally:
+            finished.set()
+
+    # The request and the stream run on a worker thread; this thread enforces the
+    # deadlines. Closing a stream does not reliably wake a read blocked in another
+    # thread, so an abandoned stream's socket is shut down, and this thread never
+    # waits on the worker for long.
+    Thread(target=copy_context().run, args=(consume,), name="model-stream", daemon=True).start()
+    stalled = None
+    try:
+        while not finished.wait(0.25):
+            limit = idle_deadline if state["started"] else first_deadline
+            if limit and monotonic() - state["last"] > limit:
+                stalled = limit
+                break
+    finally:
+        if stalled is not None or not finished.is_set():
+            with guard:
+                state["abandoned"] = True
+                stream = state["stream"]
+            if stream is not None:
+                _abort_stream(stream)
+            finished.wait(5 if stream is not None else 0.5)
+    if stalled is not None:
+        raise ModelStalled(f"no streamed output for {stalled:.0f} s "
+            + ("after generation started" if state["started"] else "(request still queued)"))
+    if "completion" in outcome:
+        client._arc_stream_unsupported = True  # Stop asking this provider to stream.
+        completion = outcome["completion"]
+        return completion, completion.model_dump(mode="json")
+    if "error" in outcome:
+        error = outcome["error"]
+        if "stream_options" in options and _stream_rejected(error) and "stream_options" in str(error):
+            client._arc_no_stream_usage = True
+            return _stream_completion(client, arguments, first_deadline, idle_deadline)
+        if first_deadline and isinstance(error, (httpx.TimeoutException, APITimeoutError)):
+            raise ModelStalled(f"no streamed output for {max(idle_deadline or 0.0, first_deadline):.0f} s "
+                "(network read timeout)") from error
+        raise error
+    finish, usage, model, response_id = meta["finish"], meta["usage"], meta["model"], meta["id"]
+    message = {"role": "assistant", "content": "".join(content) or None, "refusal": "".join(refusal) or None}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    raw = {"id": response_id, "model": model, "object": "chat.completion",
+        "choices": [{"index": 0, "finish_reason": finish, "message": message}], "usage": usage or {},
+        "_first_chunk_seconds": state.get("first_chunk")}
+    response = SimpleNamespace(id=response_id, model=model, usage=usage,
+        choices=[SimpleNamespace(index=0, finish_reason=finish, message=SimpleNamespace(**message))])
+    return response, raw
+
+
+# Time to first streamed output for successful requests, per kind of request.
+# Environments differ (the benchmark runner answered image requests far slower
+# than a laptop did), so the stall deadline adapts to what this run observes.
+_FIRST_CHUNK_TIMES = {"text": [], "vision": []}
+_FIRST_CHUNK_LOCK = Lock()
+MAX_STALL_DEADLINE = 180.0
+
+
+def _request_kind(arguments):
+    for message in arguments.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "image_url" for part in content):
+            return "vision"
+    return "text"
+
+
+def _record_first_chunk(kind, seconds):
+    with _FIRST_CHUNK_LOCK:
+        samples = _FIRST_CHUNK_TIMES[kind]
+        samples.append(seconds)
+        del samples[:-50]
+
+
+def stall_deadline(kind, attempt):
+    """First-output deadline: configured base, at least 3x the observed median, doubled per retry."""
+    if kind == "vision":
+        base = _env_seconds("ARC_STALL_FIRST_CHUNK_SECONDS_VISION", 60)
+    else:
+        base = _env_seconds("ARC_STALL_FIRST_CHUNK_SECONDS", 10)
+    with _FIRST_CHUNK_LOCK:
+        samples = sorted(_FIRST_CHUNK_TIMES[kind])
+    if len(samples) >= 3:
+        base = max(base, 3 * samples[len(samples) // 2])
+    return min(MAX_STALL_DEADLINE, base * (2 ** attempt))
+
+
+def _transient(error):
+    from openai import APIConnectionError, InternalServerError, RateLimitError
+    return isinstance(error, (APIConnectionError, InternalServerError, RateLimitError)) or getattr(error, "status_code", None) in {408, 409, 429, 500, 502, 503, 504}
+
+
+def _complete(client, arguments, label):
+    """Run one completion with stall detection; return (response, raw JSON envelope)."""
+    if not _stream_enabled(client):
+        response = client.chat.completions.create(**arguments)
+        return response, response.model_dump(mode="json")
+    idle = _env_seconds("ARC_STALL_IDLE_SECONDS", 60)
+    retries = int(_env_seconds("ARC_STALL_RETRIES", 5))
+    kind = _request_kind(arguments)
+    for attempt in range(retries + 1):
+        last = attempt == retries
+        first = None if last else stall_deadline(kind, attempt)
+        try:
+            response, raw = _stream_completion(client, arguments, first, None if last else idle)
+            if raw.get("_first_chunk_seconds") is not None:
+                _record_first_chunk(kind, raw.pop("_first_chunk_seconds"))
+            return response, raw
+        except ModelStalled as error:
+            _record("stalled", attempt=attempt + 1, message=str(error))
+            show_panel(f"[MODEL STALLED] {label}", f"{error}; cancelling and resending "
+                f"(retry {attempt + 1}/{retries}{', final attempt waits without a deadline' if attempt + 1 == retries else ''}).",
+                tone="error")
+        except Exception as error:
+            if attempt == 0 and _stream_rejected(error):
+                client._arc_stream_unsupported = True
+                print("Provider rejected streaming; using non-streaming requests (no stall detection).", flush=True)
+                response = client.chat.completions.create(**arguments)
+                return response, response.model_dump(mode="json")
+            if last or not _transient(error):
+                raise
+            # What the SDK would have retried (5xx, 429, dropped connection): back off, resend.
+            delay = min(8.0, 0.5 * 2 ** attempt)
+            _record("transient_retry", attempt=attempt + 1, error_type=type(error).__name__, message=str(error))
+            print(f"Transient model error ({type(error).__name__}); retrying in {delay:.1f}s.", flush=True)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def invoke(client, arguments: dict):
     """Audit one SDK call and show a static waiting message until it returns."""
     call_id = uuid4().hex
@@ -287,11 +537,15 @@ def invoke(client, arguments: dict):
     try:
         _record("request", arguments=arguments)
         started = monotonic()
-        response = client.chat.completions.create(**arguments)
+        response, raw = _complete(client, arguments, label)
         elapsed = monotonic() - started
-        # Preserve the SDK envelope and untouched message content before any JSON repair.
-        raw = response.model_dump(mode="json")
+        # Preserve the envelope and untouched message content before any JSON repair.
         _record("response", elapsed_seconds=elapsed, response=raw)
+        prefix = (_call.get() or {}).get("log_prefix")
+        if prefix is not None and arguments.get("stream") is None and _stream_enabled(client):
+            prefix.with_name(prefix.name + ".model.ouput").write_text(
+                "\n\n".join(_message_text(choice.get("message", {})) for choice in raw["choices"]),
+                encoding="utf-8", newline="\n")
         waiting.close()
         content = "\n".join(choice.message.content or "" for choice in response.choices)
         usage = raw.get("usage") or {}

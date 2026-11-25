@@ -130,7 +130,9 @@ def implement_ui(arc_dir: Path, design: dict, model, console, report: dict, max_
             require_green(result["tests"])
             return result
 
-        with implementation_task(output, report["pages"][pid], console, "10 / " + pid):
+        # Frontend-only rollback: stage 06 may be editing the backend concurrently.
+        with implementation_task(output, report["pages"][pid], console, "10 / " + pid,
+                roots=("frontend/src", "frontend/tests"), index_kinds=("page",)):
             # Compile tests separately before deciding whether browser failure is RED.
             try:
                 current = implementation_checks()
@@ -167,7 +169,7 @@ def implement_ui(arc_dir: Path, design: dict, model, console, report: dict, max_
     verification = final_checks(console,
         typecheck=(lambda: checks.typecheck(files), None),
         tests=(lambda: checks.tests(files), require_green),
-        build=(checks.build, None))
+        build=(checks.build_frontend, None))
     final = verification["tests"].get("result") or {}
     report["summary"] = {"pages": len(accepted), "tests": final.get("passed", 0), "failed": final.get("failed", 0)}
     complete_report(report, report["pages"].values(), verification)
